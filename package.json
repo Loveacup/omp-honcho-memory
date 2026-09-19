@@ -1,0 +1,64 @@
+{
+  "name": "omp-honcho-memory",
+  "version": "0.3.0",
+  "type": "module",
+  "description": "Honcho-backed cross-session memory extension for Oh My Pi",
+  "license": "MIT",
+  "author": "Loveacup",
+  "contributors": [
+    "citywalki"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Loveacup/omp-honcho-memory.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Loveacup/omp-honcho-memory/issues"
+  },
+  "homepage": "https://github.com/Loveacup/omp-honcho-memory#readme",
+  "keywords": [
+    "oh-my-pi",
+    "omp",
+    "honcho",
+    "memory",
+    "extension",
+    "ai"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/extensions/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "clean": "rm -rf dist",
+    "build": "bun build ./extensions/index.ts --outdir ./dist --target bun --external @oh-my-pi/pi-coding-agent && tsc --emitDeclarationOnly",
+    "check": "tsc --noEmit",
+    "verify": "python3 verification/verify-raw-search.py && python3 verification/verify-raw-recall.py && python3 verification/verify-raw-injection.py",
+    "prepublishOnly": "bun run clean && bun run check && bun run build"
+  },
+  "dependencies": {
+    "@honcho-ai/sdk": "^2.1.1",
+    "js-yaml": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.8",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.13.9",
+    "typescript": "^5.9.3",
+    "zod": "^4.4.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "omp": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  }
+}

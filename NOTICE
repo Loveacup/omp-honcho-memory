@@ -1,0 +1,17 @@
+OMP Honcho Memory
+
+This project is derived from @citywalki/oh-my-pi-honcho-memory version 0.2.0.
+The npm package metadata identifies citywalki as the author and declares the
+original package under the MIT License. The repository URL recorded by that
+package was unavailable when this derivative repository was prepared.
+
+Substantial changes in this derivative include:
+- exact configured peer identity preservation;
+- native OMP chat-instance session mapping;
+- serialized and acknowledged turn persistence;
+- bounded raw workspace recall with provenance handling;
+- lifecycle-aware flush and compaction behavior;
+- transient bilingual runtime notifications.
+
+No private configuration, API credentials, session transcripts, cloud exports,
+or user-specific identity values are included in this repository.

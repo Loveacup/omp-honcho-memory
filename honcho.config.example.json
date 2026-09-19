@@ -1,0 +1,16 @@
+{
+  "peerName": "YOUR_USER_PEER",
+  "apiKey": "${HONCHO_API_KEY}",
+  "hosts": {
+    "omp": {
+      "enabled": true,
+      "workspace": "YOUR_WORKSPACE",
+      "peerName": "YOUR_USER_PEER",
+      "aiPeer": "omp",
+      "sessionStrategy": "chat-instance",
+      "sessionPeerPrefix": false,
+      "observationMode": "unified",
+      "saveMessages": true
+    }
+  }
+}
