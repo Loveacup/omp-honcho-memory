@@ -1,27 +1,75 @@
-# OMP Honcho Memory
+<div align="center">
+  <h1>🧠 OMP Honcho Memory</h1>
+  <p><strong>让 Oh My Pi 拥有可追溯、有边界的跨会话记忆</strong></p>
+  <p>基于 <a href="https://honcho.dev">Honcho</a> 的 OMP 记忆扩展：绑定原生聊天会话，在模型请求前召回相关历史，并在每轮结束后可靠写回。</p>
+  <p>
+    <a href="https://github.com/can1357/oh-my-pi"><img src="https://img.shields.io/badge/OMP-18.2.5%2B-6f42c1?style=flat-square" alt="OMP 18.2.5+"/></a>
+    <a href="https://bun.sh"><img src="https://img.shields.io/badge/Bun-1.3%2B-000000?style=flat-square&amp;logo=bun&amp;logoColor=white" alt="Bun 1.3+"/></a>
+    <img src="https://img.shields.io/badge/TypeScript-5.9-3178C6?style=flat-square&amp;logo=typescript&amp;logoColor=white" alt="TypeScript 5.9"/>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-2ea44f?style=flat-square" alt="MIT License"/></a>
+  </p>
+</div>
 
-为 [Oh My Pi（OMP）](https://github.com/can1357/oh-my-pi) 提供基于 Honcho 的跨会话记忆扩展。
+> [!IMPORTANT]
+> 本扩展会把获准的对话内容发送到 Honcho。安装前请确认数据范围、凭据存储方式和 Honcho 账户的数据政策；首次验证只使用非敏感的合成数据。
 
-它为每个 OMP 原生聊天绑定独立 Honcho Session，在模型请求前注入有界相关记忆，并在每轮结束后上传完整的用户与助手消息。
+<p align="center">
+  <a href="#core">核心能力</a> ·
+  <a href="#architecture">工作原理</a> ·
+  <a href="#user-guide">个人用户指南</a> ·
+  <a href="#agent-guide">AI／Agent 配置</a> ·
+  <a href="#boundaries">可靠性与安全边界</a>
+</p>
 
-> **重要：**本扩展会把获准的对话内容发送到 Honcho。安装前请先确认数据范围、凭据存储方式和 Honcho 账户的数据政策。不要用生产隐私数据做首次验证。
+<a id="core"></a>
 
-## 核心能力
+## ✨ 核心能力
 
-- 精确保留配置中的 Peer ID，不强制小写，也不添加 `user-`／`ai-` 前缀。
-- 使用 OMP 原生 `sessionManager.getSessionId()`；缺少 Session ID 时明确拒绝，不回退到共享 `default`。
-- 推荐 `chat-instance`：一个 OMP 聊天对应一个 Honcho Session。
-- 在请求前注入有预算限制的结构化上下文与 workspace 原始搜索结果。
-- 串行上传消息；仅在远端确认成功后推进本地去重游标。
-- 在会话切换、压缩和关闭时刷新待处理写入。
-- 使用中英双语瞬时通知，不长期占用 OMP 底部状态栏。
-- 提供搜索、上下文检查、结论写入和健康检查工具。
+| 能力 | 行为 |
+|---|---|
+| 👤 **精确身份** | 保留配置中的 Peer ID，不强制小写，也不添加 `user-`／`ai-` 前缀 |
+| 🔗 **原生会话** | 使用 `sessionManager.getSessionId()`；缺少 Session ID 时拒绝回退到共享 `default` |
+| 🧭 **跨会话召回** | 推荐 `chat-instance`；请求前注入有预算限制的结构化上下文与 workspace 原始消息 |
+| 💾 **确认式持久化** | 串行上传消息，仅在远端确认成功后推进进程内去重状态 |
+| 🔄 **生命周期保护** | 在会话切换、压缩和关闭时刷新待处理写入 |
+| 🔔 **轻量反馈** | 使用中英双语瞬时通知，不长期占用 OMP 底部状态栏 |
+| 🧰 **可观测工具** | 提供搜索、上下文检查、结论写入和健康检查工具 |
+
+<a id="architecture"></a>
+
+## ⚙️ 工作原理
+
+```mermaid
+flowchart LR
+    A["💬 OMP Prompt"] --> B{"🔎 并行召回"}
+    B --> C["结构化 Context"]
+    B --> D["Workspace 原始消息"]
+    C --> E["📦 有界注入<br/>System Prompt"]
+    D --> E
+    E --> F["🤖 Agent 回答"]
+    F --> G["🔐 消息指纹去重"]
+    G --> H["☁️ 串行写回 Honcho"]
+```
+
+| 阶段 | 核心逻辑 |
+|---|---|
+| **绑定** | 使用配置中的原始 Peer ID，并用 OMP 原生 Session ID 生成 Honcho Session；缺少原生 ID 时停止工作，避免聊天串线 |
+| **水合** | 会话启动时读取 Peer Representation、Peer Card 和 Session Summary，建立可刷新的上下文缓存 |
+| **召回** | 每个有效 Prompt 并行刷新结构化上下文，并查询最多 10 条 workspace 原始消息 |
+| **注入** | 召回结果带来源与完整性标记，只进入本轮 System Prompt 的固定预算区域，不回写缓存或 Honcho |
+| **持久化** | 每轮结束后按原生消息身份生成指纹，过滤已确认消息并串行上传；远端成功后才更新进程内确认集 |
+| **生命周期** | 会话切换、压缩和关闭前等待已排队上传；压缩前重新水合长期记忆，关闭标记在 OMP 时限内尽力写入 |
+
+> [!NOTE]
+> 原始召回是有界的历史证据，不是当前指令或完整数据库视图；确认式重试降低丢失风险，但不承诺 exactly-once。
 
 ---
 
-# 第一部分：给个人用户
+<a id="user-guide"></a>
 
-## 1. 适用条件
+## 👤 第一部分：个人用户指南
+
+### 1. 适用条件
 
 - OMP 18.2.5 或更新版本。
 - Bun 1.3 或更新版本。
@@ -30,7 +78,7 @@
 
 OMP 的扩展 API 可能随版本变化。每次升级 OMP 后都应重新执行本文的验证步骤。
 
-## 2. 下载与构建
+### 2. 下载与构建
 
 ```sh
 git clone https://github.com/Loveacup/omp-honcho-memory.git
@@ -42,7 +90,7 @@ bun run build
 
 不要安装来历不明的预构建文件。当前仓库默认要求从源码构建。
 
-## 3. 配置 Honcho
+### 3. 配置 Honcho
 
 创建 `~/.honcho/config.json`。示例中的身份和 workspace 都必须替换成你自己的值：
 
@@ -54,7 +102,6 @@ bun run build
     "omp": {
       "enabled": true,
       "workspace": "YOUR_WORKSPACE",
-      "peerName": "YOUR_USER_PEER",
       "aiPeer": "omp",
       "sessionStrategy": "chat-instance",
       "sessionPeerPrefix": false,
@@ -83,7 +130,7 @@ chmod 600 ~/.honcho/config.json
 
 不要把真实 key 写入本仓库、聊天记录、截图、Issue 或公开日志。
 
-## 4. 安装到 OMP
+### 4. 安装到 OMP
 
 先备份已有同名扩展，再安装新构建：
 
@@ -98,7 +145,7 @@ cp dist/index.js ~/.omp/agent/extensions/honcho-memory.js
 
 重启 OMP。不要同时从项目级和用户级目录加载两份 Honcho 扩展。
 
-## 5. 首次验证
+### 5. 首次验证
 
 先运行离线检查：
 
@@ -118,7 +165,7 @@ bun run verify
 
 仅看到模型回答正确，不足以证明捕获和召回链路通过；还要核对 Honcho 远端记录。
 
-## 6. 界面提示
+### 6. 界面提示
 
 扩展不会长期显示 `connected` 状态，而是显示瞬时通知：
 
@@ -131,7 +178,7 @@ bun run verify
 
 失败通知表示本轮同步不能被视为成功。不要仅因后续对话仍可继续，就忽略同步失败。
 
-## 7. 更新
+### 7. 更新
 
 ```sh
 cd omp-honcho-memory
@@ -145,7 +192,7 @@ cp dist/index.js ~/.omp/agent/extensions/honcho-memory.js
 
 完成后重启 OMP，并至少执行一次合成数据捕获与跨会话召回。
 
-## 8. 回滚或卸载
+### 8. 回滚或卸载
 
 恢复备份：
 
@@ -164,11 +211,13 @@ rm ~/.omp/agent/extensions/honcho-memory.js
 
 ---
 
-# 第二部分：给 AI／Agent 配置
+<a id="agent-guide"></a>
+
+## 🤖 第二部分：AI／Agent 配置
 
 本节是执行契约，不是“看到文件存在就算完成”的安装清单。
 
-## 1. 目标
+### 1. 目标
 
 在不泄露密钥、不覆盖其他客户端配置、不制造第二写入器的前提下：
 
@@ -178,7 +227,7 @@ rm ~/.omp/agent/extensions/honcho-memory.js
 4. 用合成数据证明配置解析、扩展加载、远端捕获和跨会话召回。
 5. 输出可定位证据和未覆盖边界。
 
-## 2. 必须先取得的输入
+### 2. 必须先取得的输入
 
 AI 在执行前必须确认以下值；不得从用户名、目录名或旧日志猜测：
 
@@ -196,7 +245,7 @@ allowed_data_scope: 用户明确批准的捕获和召回范围
 
 缺少 workspace、用户 Peer、凭据来源或数据授权时，停止生产接入；可以继续做不联网的构建和离线验证。
 
-## 3. 禁止事项
+### 3. 禁止事项
 
 AI 不得：
 
@@ -211,9 +260,9 @@ AI 不得：
 - 把独立 Peer 或 Session 当作访问控制。
 - 宣称 exactly-once、崩溃持久队列或跨设备兼容已经得到保证。
 
-## 4. 推荐执行流程
+### 4. 推荐执行流程
 
-### A. 固定源码
+#### A. 固定源码
 
 ```sh
 git clone https://github.com/Loveacup/omp-honcho-memory.git
@@ -224,7 +273,7 @@ bun install --frozen-lockfile
 
 把实际 commit 记录到验收回执。不要只写 `main`。
 
-### B. 离线验证
+#### B. 离线验证
 
 ```sh
 bun run check
@@ -235,15 +284,14 @@ bun -e 'const m = await import("./dist/index.js"); if (typeof m.default !== "fun
 
 任一命令非零退出即停止安装，不得跳过失败步骤。
 
-### C. 安全合并配置
+#### C. 安全合并配置
 
-目标 `hosts.omp`：
+目标 `hosts.omp`。用户 Peer 由根级 `peerName` 或环境变量 `HONCHO_PEER_NAME` 提供，不写入 host scope：
 
 ```json
 {
   "enabled": true,
   "workspace": "USER_APPROVED_WORKSPACE",
-  "peerName": "USER_APPROVED_PEER",
   "aiPeer": "omp",
   "sessionStrategy": "chat-instance",
   "sessionPeerPrefix": false,
@@ -261,7 +309,7 @@ bun -e 'const m = await import("./dist/index.js"); if (typeof m.default !== "fun
 5. 配置文件权限设为 `0600`。
 6. 使用扩展的有效配置读回或健康检查确认最终 workspace 与 Peer；日志中不得出现 key。
 
-### D. 安装单一扩展
+#### D. 安装单一扩展
 
 优先使用目标 OMP 已验证的用户级目录：
 
@@ -272,7 +320,7 @@ cp dist/index.js ~/.omp/agent/extensions/honcho-memory.js
 
 安装前备份同名文件；安装后重启 OMP。若目标机器实际使用其他发现路径，以实测路径为准，不机械照抄。
 
-### E. 运行时验收
+#### E. 运行时验收
 
 使用唯一、非敏感、可删除的合成标记，完成以下检查：
 
@@ -286,7 +334,7 @@ cp dist/index.js ~/.omp/agent/extensions/honcho-memory.js
 | 失败行为 | 无凭据或网络失败时明确降级，不把失败记为成功 |
 | 隔离 | 没有创建带错误前缀、错误大小写或 `default` 的身份／Session |
 
-## 5. AI 回执模板
+### 5. AI 回执模板
 
 ```yaml
 repository: https://github.com/Loveacup/omp-honcho-memory
@@ -317,7 +365,9 @@ rollback: 已验证的回滚命令或步骤
 
 ---
 
-## 可靠性边界
+<a id="boundaries"></a>
+
+## 🛡️ 可靠性边界
 
 - 远端成功后本地超时，重试仍可能产生重复消息；服务端路径不是 exactly-once。
 - 上传队列仅存在于当前进程，不是崩溃后可恢复的持久 journal。
@@ -325,19 +375,19 @@ rollback: 已验证的回滚命令或步骤
 - 自动长期结论提取保持克制，但仍可能把临时偏好误判为稳定偏好。
 - Peer、Session 和 scope 不等于强制访问控制。
 
-## 安全边界
+## 🔐 安全边界
 
 - 永远不要提交 `~/.honcho/config.json`、`.env`、API key、会话转录、云端导出或运行日志。
 - 首次验证只使用合成、非敏感数据。
 - 每次 OMP 升级后重新检查扩展 API 和生命周期行为。
 - 公开 Issue 中只放脱敏复现，不上传真实会话或配置。
 
-## 上游归属
+## 🌱 上游归属
 
 本项目派生自 `@citywalki/oh-my-pi-honcho-memory` 0.2.0，并针对身份精确保留、OMP 原生 Session、可靠轮次持久化、有界来源感知召回和中英双语运行通知进行了较大调整。
 
 详见 [NOTICE](NOTICE)。
 
-## License
+## 📄 License
 
 MIT，详见 [LICENSE](LICENSE)。
