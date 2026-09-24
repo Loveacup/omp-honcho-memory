@@ -1,8 +1,8 @@
 {
   "name": "omp-honcho-memory",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "type": "module",
-  "description": "Honcho-backed cross-session memory extension for Oh My Pi",
+  "description": "Unified Honcho cognition plugin for OMP, Claude Code, and Codex",
   "license": "MIT",
   "author": "Loveacup",
   "contributors": [
@@ -28,6 +28,9 @@
   "types": "./dist/extensions/index.d.ts",
   "files": [
     "dist",
+    "scripts/cognition.ts",
+    "core/source.ts",
+    "extensions/config.ts",
     "README.md",
     "LICENSE",
     "NOTICE"
@@ -37,13 +40,15 @@
   },
   "scripts": {
     "clean": "rm -rf dist",
-    "build": "bun build ./extensions/index.ts --outdir ./dist --target bun --external @oh-my-pi/pi-coding-agent && tsc --emitDeclarationOnly",
+    "build": "bun build ./extensions/index.ts --outfile ./dist/index.js --target bun --external @oh-my-pi/pi-coding-agent && bun build ./hooks/honcho-hook.ts --outfile ./dist/honcho-hook.mjs --target node && bun build ./hooks/honcho-mcp.ts --outfile ./dist/honcho-mcp.mjs --target node && tsc --emitDeclarationOnly",
     "check": "tsc --noEmit",
+    "test:source": "bun test test/source.test.ts",
     "verify": "python3 verification/verify-raw-search.py && python3 verification/verify-raw-recall.py && python3 verification/verify-raw-injection.py",
     "prepublishOnly": "bun run clean && bun run check && bun run build"
   },
   "dependencies": {
     "@honcho-ai/sdk": "^2.1.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "js-yaml": "^4.1.0"
   },
   "devDependencies": {

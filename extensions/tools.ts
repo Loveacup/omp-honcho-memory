@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
-import type { HonchoHandles } from "./client.js";
+import { userConclusionObserver, userConclusionView, type HonchoHandles } from "./client.js";
 import {
 	resolveConfig,
 	saveConfig,
@@ -66,17 +66,13 @@ export function registerTools(pi: ExtensionAPI, deps: ToolRegistryDependencies):
 				return { content: [{ type: "text", text: "Honcho is not initialized for this session." }] };
 			}
 			try {
-				const peer =
-					params.target === "ai"
-						? handles.aiPeer
-						: handles.userPeer;
-				if (!peer) {
-					return {
-						content: [{ type: "text", text: `No ${params.target} peer is configured.` }],
-						isError: true,
-					};
-				}
-				const result = await peer.context({ maxConclusions: params.maxConclusions, includeMostFrequent: true });
+				const peer = params.target === "ai" ? handles.aiPeer : userConclusionObserver(handles);
+				const target = params.target === "user" && peer === handles.aiPeer ? handles.userPeer : undefined;
+				const result = await peer.context({
+					...(target ? { target } : {}),
+					maxConclusions: params.maxConclusions,
+					includeMostFrequent: true,
+				});
 				const parts: string[] = [];
 				if (result.representation) parts.push(result.representation);
 				if (result.peerCard?.length) parts.push(...result.peerCard.map((f: string) => `- ${f}`));
@@ -107,8 +103,9 @@ export function registerTools(pi: ExtensionAPI, deps: ToolRegistryDependencies):
 				return { content: [{ type: "text", text: "Honcho is not initialized for this session." }] };
 			}
 			try {
-				const peer = params.target === "ai" ? handles.aiPeer : handles.userPeer;
-				const result = await peer.context();
+				const peer = params.target === "ai" ? handles.aiPeer : userConclusionObserver(handles);
+				const target = params.target === "user" && peer === handles.aiPeer ? handles.userPeer : undefined;
+				const result = await peer.context(target ? { target } : undefined);
 				return {
 					content: [{ type: "text", text: result.representation || "No representation available." }],
 				};
@@ -171,17 +168,9 @@ export function registerTools(pi: ExtensionAPI, deps: ToolRegistryDependencies):
 				return { content: [{ type: "text", text: "Honcho is not initialized for this session." }] };
 			}
 			try {
-				const peerId = handles.userPeerId;
-				if (!peerId) {
-					return {
-						content: [{ type: "text", text: `No ${params.target} peer is configured.` }],
-						isError: true,
-					};
-				}
-				const peer = await handles.honcho.peer(peerId);
-				const page = await peer.conclusions.list({ size: params.limit });
+				const page = await userConclusionView(handles).list({ size: params.limit });
 				const items = page.items ?? [];
-				const lines = items.map((item: { content?: string }) => `- ${item.content ?? ""}`);
+				const lines = items.map((item) => `- ${item.id}: ${item.content}`);
 				return {
 					content: [
 						{
@@ -216,7 +205,7 @@ export function registerTools(pi: ExtensionAPI, deps: ToolRegistryDependencies):
 				return { content: [{ type: "text", text: "Honcho is not initialized for this session." }] };
 			}
 			try {
-				await handles.aiPeer.conclusionsOf(handles.userPeer).create({
+				await userConclusionView(handles).create({
 					content: params.content,
 					sessionId: handles.session.id,
 				});
@@ -248,7 +237,7 @@ export function registerTools(pi: ExtensionAPI, deps: ToolRegistryDependencies):
 				return { content: [{ type: "text", text: "Honcho is not initialized for this session." }] };
 			}
 			try {
-				await handles.aiPeer.conclusionsOf(handles.userPeer).create({
+				await userConclusionView(handles).create({
 					content: params.content,
 					sessionId: handles.session.id,
 				});
@@ -279,8 +268,8 @@ export function registerTools(pi: ExtensionAPI, deps: ToolRegistryDependencies):
 				return { content: [{ type: "text", text: "Honcho is not initialized for this session." }] };
 			}
 			try {
-				const scopePeer = handles.config.observationMode === "unified" ? handles.userPeer : handles.aiPeer;
-				const conclusionScope = scopePeer.conclusionsOf(handles.userPeer);
+				const conclusionScope = userConclusionView(handles);
+				await conclusionScope.get(params.id);
 				await conclusionScope.delete(params.id);
 				return { content: [{ type: "text", text: `Deleted conclusion ${params.id}` }] };
 			} catch (error) {
@@ -296,7 +285,7 @@ export function registerTools(pi: ExtensionAPI, deps: ToolRegistryDependencies):
 		name: "honcho_set_config",
 		label: "Honcho Set Config",
 		description:
-			"Update a Honcho plugin configuration field in ~/.honcho/config.json. Dangerous changes (workspace, endpoint) require confirm=true.",
+			"Update a Honcho plugin configuration field in $HONCHO_CONFIG_DIR/config.json or ~/.honcho/config.json. Dangerous changes (workspace, endpoint) require confirm=true.",
 		parameters: z.object({
 			field: z.enum([
 				"peerName",

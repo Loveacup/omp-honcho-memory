@@ -208,6 +208,8 @@ const fakeSession = {
   search: async () => [],
 };
 mock.module("__CLIENT_IMPORT__", () => ({
+  userConclusionObserver: (handles) => handles.userPeer,
+  userConclusionView: (handles) => handles.userPeer.conclusionsOf(handles.userPeer),
   createHonchoHandles: async ({ config, sessionKey }) => ({
     honcho: {}, workspaceId: config.workspace, sessionId: sessionKey,
     userPeerId: config.peerName, aiPeerId: config.aiPeer,
@@ -280,6 +282,8 @@ ok("before_agent_start handler registered", typeof beforeStart === "function");
 // ---- mock ExtensionContext ----
 const ctx = {
   cwd: "/tmp/s2b-verify",
+  mode: "tui",
+  hasUI: true,
   sessionManager: { getSessionId: () => "sess-1", getBranch: () => [] },
   ui: { setStatus: () => {}, notify: () => {}, input: async () => null,
         confirm: async () => false, select: async () => null },
@@ -827,7 +831,10 @@ mock.module("__CONFIG_IMPORT__", () => ({
 const fp = (id) => ({ id, message: (content, o) => ({ peerId: id, content, metadata: o?.metadata }),
   context: async () => ({ representation: "", peerCard: null }),
   conclusionsOf: () => ({ create: async () => ({}), delete: async () => ({}) }), chat: async () => null });
-mock.module("__CLIENT_IMPORT__", () => ({ createHonchoHandles: async ({ config, sessionKey }) => ({
+mock.module("__CLIENT_IMPORT__", () => ({
+  userConclusionObserver: (handles) => handles.userPeer,
+  userConclusionView: (handles) => handles.userPeer.conclusionsOf(handles.userPeer),
+  createHonchoHandles: async ({ config, sessionKey }) => ({
   honcho: {}, workspaceId: config.workspace, sessionId: sessionKey, userPeerId: config.peerName, aiPeerId: config.aiPeer,
   userPeerName: config.peerName, aiPeerName: config.aiPeer, userPeer: fp(config.peerName), aiPeer: fp(config.aiPeer),
   session: { id: "s", addMessages: async () => ({}), addPeers: async () => ({}), summaries: async () => ({}),
@@ -901,7 +908,10 @@ mock.module("__CONFIG_IMPORT__", () => ({
 const fp = (id) => ({ id, message: (content, o) => ({ peerId: id, content, metadata: o?.metadata }),
   context: async () => ({ representation: "", peerCard: null }),
   conclusionsOf: () => ({ create: async () => ({}), delete: async () => ({}) }), chat: async () => null });
-mock.module("__CLIENT_IMPORT__", () => ({ createHonchoHandles: async ({ config, sessionKey }) => ({
+mock.module("__CLIENT_IMPORT__", () => ({
+  userConclusionObserver: (handles) => handles.userPeer,
+  userConclusionView: (handles) => handles.userPeer.conclusionsOf(handles.userPeer),
+  createHonchoHandles: async ({ config, sessionKey }) => ({
   honcho: {}, workspaceId: config.workspace, sessionId: sessionKey, userPeerId: config.peerName, aiPeerId: config.aiPeer,
   userPeerName: config.peerName, aiPeerName: config.aiPeer, userPeer: fp(config.peerName), aiPeer: fp(config.aiPeer),
   session: { id: "s", addMessages: async () => ({}), addPeers: async () => ({}), summaries: async () => ({}),
@@ -986,7 +996,10 @@ mock.module("__CONFIG_IMPORT__", () => ({
 const fp = (id) => ({ id, message: (content, o) => ({ peerId: id, content, metadata: o?.metadata }),
   context: async () => ({ representation: "", peerCard: null }),
   conclusionsOf: () => ({ create: async () => ({}), delete: async () => ({}) }), chat: async () => null });
-mock.module("__CLIENT_IMPORT__", () => ({ createHonchoHandles: async ({ config, sessionKey }) => ({
+mock.module("__CLIENT_IMPORT__", () => ({
+  userConclusionObserver: (handles) => handles.userPeer,
+  userConclusionView: (handles) => handles.userPeer.conclusionsOf(handles.userPeer),
+  createHonchoHandles: async ({ config, sessionKey }) => ({
   honcho: {}, workspaceId: config.workspace, sessionId: sessionKey, userPeerId: config.peerName, aiPeerId: config.aiPeer,
   userPeerName: config.peerName, aiPeerName: config.aiPeer, userPeer: fp(config.peerName), aiPeer: fp(config.aiPeer),
   session: { id: "s", addMessages: async () => ({}), addPeers: async () => ({}), summaries: async () => ({}),
@@ -1015,7 +1028,8 @@ const pi = { on: (e, f) => { (handlers[e] ||= []).push(f); }, registerTool: () =
   appendEntry: () => {}, getFlag: () => undefined, setLabel: () => {}, zod: zodShim(), logger: {}, pi: {} };
 mod.default(pi);
 const beforeStart = handlers["before_agent_start"][0];
-const ctx = { cwd: "/tmp/s2b-abortlate", sessionManager: { getSessionId: () => "sess-1", getBranch: () => [] },
+const ctx = { cwd: "/tmp/s2b-abortlate", mode: "tui", hasUI: true,
+  sessionManager: { getSessionId: () => "sess-1", getBranch: () => [] },
   ui: { setStatus: () => {}, notify: () => {} }, getSystemPrompt: () => [] };
 
 function rec(over) { return Object.assign({ id: "m1", content: "hello", peer_id: FAKE_PEER, session_id: "s1",

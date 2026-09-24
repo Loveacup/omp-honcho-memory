@@ -459,19 +459,24 @@ console.log("RECALL_SUMMARY total=" + total + " failures=" + failures);
 process.exit(failures ? 1 : 0);
 '''
 
-
 MUTATION_PLUGIN = r'''
 import { plugin } from "bun";
 await plugin({ name: "disable-lt-escape", setup(build) {
   build.onLoad({ filter: /raw-recall\.ts$/ }, async ({ path }) => {
     const source = await Bun.file(path).text();
-    const needle = ".replace(/</g, ";
-    if (source.split(needle).length !== 2) throw new Error("mutation anchor mismatch (expected exactly one '<' escape call)");
+    const start = source.indexOf("function escapeEmbed(");
+    const end = source.indexOf("\n}\n\nfunction serialize(", start);
+    if (start < 0 || end < 0) throw new Error("escapeEmbed function not found");
+    const body = source.slice(start, end);
+    const mutated = body.replace('.replace(/</g, "\\\\u003c")', '.replace(/<SKIP_NEVER_MATCH>/g, "\\\\u003c")');
+    if (mutated === body) throw new Error("escapeEmbed less-than mutation not applied");
     console.log("MUTATION_APPLIED disable-<-escape");
-    return { contents: source.replace(needle, ".replace(/<SKIP_NEVER_MATCH>/g, "), loader: "ts" };
+    return { contents: source.slice(0, start) + mutated + source.slice(end), loader: "ts" };
   });
 } });
 '''
+
+
 
 
 def run_harness(name: str, source: str, workdir: Path, bun: str) -> tuple[int, str]:
@@ -528,8 +533,8 @@ def main() -> int:
         report.append(f"MAIN_ASSERTIONS total={t} failures={f} exit={rc}\n")
         overall = overall or rc
 
-        # Negative control runs only when the module exists (nothing to mutate
-        # otherwise). It MUST go RED on the escaping assertion.
+        # Negative control: disable only escapeEmbed's less-than escaping and
+        # require the behavioral escaping assertion to catch it.
         if RAW_RECALL.exists():
             mrc, mout = run_harness("mutate", MUTATION_PLUGIN + main_src, workdir, bun)
             report.append(mout)
@@ -545,6 +550,7 @@ def main() -> int:
                 "$ mutation control SKIPPED :: extensions/raw-recall.ts absent "
                 "(RED baseline; nothing to mutate yet)\n"
             )
+
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

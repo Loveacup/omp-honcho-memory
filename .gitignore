@@ -7,3 +7,6 @@ dist/
 coverage/
 .honcho/
 .omp/
+
+# Frozen R33-R41 assets: kept locally for history, not published
+frozen/

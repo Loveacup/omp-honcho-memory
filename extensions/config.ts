@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import type { HonchoHost } from "../core/source.js";
 
 
 export type HonchoSessionStrategy =
@@ -37,6 +38,7 @@ export interface HonchoExtensionConfig {
 	contextTokens: number;
 	commitEveryNTurns: number;
 	saveMessages: boolean;
+	injectPerPrompt: boolean;
 	endpoint: HonchoEndpointConfig;
 	messageUpload: HonchoMessageUploadConfig;
 	contextRefresh: {
@@ -59,6 +61,7 @@ const DEFAULTS: HonchoExtensionConfig = {
 	contextTokens: 1200,
 	commitEveryNTurns: 4,
 	saveMessages: true,
+	injectPerPrompt: true,
 	endpoint: { environment: "production" },
 	messageUpload: {},
 	contextRefresh: {
@@ -84,19 +87,22 @@ function stripUndefined<T extends Record<string, unknown>>(obj: T): Partial<T> {
 	return result;
 }
 
-const DEFAULT_HOST = "omp";
+const DEFAULT_HOST: HonchoHost = "omp";
 // ============================================
-// Config file: ~/.honcho/config.json
+// Config file: $HONCHO_CONFIG_DIR/config.json or ~/.honcho/config.json
 // Following the official claude-honcho / pi-honcho-memory pattern
 // ============================================
 
 function honchoConfigPath(): string {
+	const override = process.env.HONCHO_CONFIG_DIR?.trim();
+	if (override) return join(resolve(override), "config.json");
 	const home = process.env.HOME ?? process.env.USERPROFILE ?? "/tmp";
 	return join(home, ".honcho", "config.json");
 }
 
 /** Per-host / per-directory overrides within config.json */
 interface HonchoScopeConfig {
+	enabled?: boolean;
 	apiKey?: string;
 	url?: string;
 	workspace?: string;
@@ -108,6 +114,7 @@ interface HonchoScopeConfig {
 	contextTokens?: number;
 	commitEveryNTurns?: number;
 	saveMessages?: boolean;
+	injectPerPrompt?: boolean;
 	endpoint?: HonchoEndpointConfig;
 	messageUpload?: HonchoMessageUploadConfig;
 	contextRefresh?: {
@@ -132,6 +139,7 @@ interface HonchoFileConfig {
 	contextTokens?: number;
 	commitEveryNTurns?: number;
 	saveMessages?: boolean;
+	injectPerPrompt?: boolean;
 	endpoint?: HonchoEndpointConfig;
 	messageUpload?: HonchoMessageUploadConfig;
 	contextRefresh?: {
@@ -204,7 +212,7 @@ function matchDirectory(
 
 function honchoConfigToPartial(config: HonchoScopeConfig): Partial<HonchoExtensionConfig> {
 	const result: Partial<HonchoExtensionConfig> = stripUndefined({
-		enabled: (config as HonchoScopeConfig & { enabled?: boolean }).enabled,
+		enabled: config.enabled,
 		apiKey: config.apiKey,
 		url: config.url,
 		workspace: config.workspace,
@@ -216,6 +224,7 @@ function honchoConfigToPartial(config: HonchoScopeConfig): Partial<HonchoExtensi
 		contextTokens: config.contextTokens,
 		commitEveryNTurns: config.commitEveryNTurns,
 		saveMessages: config.saveMessages,
+		injectPerPrompt: config.injectPerPrompt,
 		endpoint: config.endpoint,
 		messageUpload: config.messageUpload,
 	});
@@ -241,9 +250,10 @@ function honchoConfigToPartial(config: HonchoScopeConfig): Partial<HonchoExtensi
 // Resolve
 // ============================================
 
-export function resolveConfig(cwd: string): HonchoExtensionConfig {
+export function resolveConfigForHost(host: HonchoHost, cwd: string): HonchoExtensionConfig {
 	const honchoFile = readHonchoConfig();
-	const hostScoped = honchoFile.hosts?.[DEFAULT_HOST] ?? {};
+	const hostExists = Object.prototype.hasOwnProperty.call(honchoFile.hosts ?? {}, host);
+	const hostScoped = honchoFile.hosts?.[host] ?? {};
 	const dirScoped = matchDirectory(cwd, honchoFile.directories ?? {});
 
 	const envHoncho: Partial<HonchoExtensionConfig> = stripUndefined({
@@ -272,11 +282,14 @@ export function resolveConfig(cwd: string): HonchoExtensionConfig {
 			contextTokens: honchoFile.contextTokens,
 			commitEveryNTurns: honchoFile.commitEveryNTurns,
 			saveMessages: honchoFile.saveMessages,
+			injectPerPrompt: honchoFile.injectPerPrompt,
 			endpoint: honchoFile.endpoint,
 			messageUpload: honchoFile.messageUpload,
 			contextRefresh: honchoFile.contextRefresh,
 		}),
-		// Config file hosts.omp block
+		// A declared host defaults on only when neither the host nor the root
+		// explicitly chooses enabled/disabled.
+		...(hostExists && hostScoped.enabled === undefined && honchoFile.enabled === undefined ? { enabled: true } : {}),
 		...honchoConfigToPartial(hostScoped),
 		// Config file directories block
 		...honchoConfigToPartial(dirScoped),
@@ -301,6 +314,10 @@ export function resolveConfig(cwd: string): HonchoExtensionConfig {
 	return merged as HonchoExtensionConfig;
 }
 
+export function resolveConfig(cwd: string): HonchoExtensionConfig {
+	return resolveConfigForHost(DEFAULT_HOST, cwd);
+}
+
 export function getSessionOverride(cwd: string): string | null {
 	const file = readHonchoConfig();
 	if (!file.sessions) return null;
@@ -314,6 +331,8 @@ const HONCHO_BASE_URLS: Record<HonchoEnvironment, string> = {
 
 export function getHonchoBaseUrl(config: HonchoExtensionConfig): string {
 	if (config.endpoint?.baseUrl) return config.endpoint.baseUrl;
+	// An explicit url (config file or HONCHO_URL) beats the default environment.
+	if (config.url && config.url !== DEFAULTS.url) return config.url;
 	if (config.endpoint?.environment) return HONCHO_BASE_URLS[config.endpoint.environment];
 	return config.url || HONCHO_BASE_URLS.production;
 }

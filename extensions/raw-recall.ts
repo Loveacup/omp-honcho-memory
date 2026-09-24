@@ -397,3 +397,26 @@ export function formatRawRecall(
 	}
 	return out;
 }
+
+/**
+ * Wrap already-formatted recall/context in the shared self-recall envelope.
+ * The body is XML-escaped and prefix-bounded while the closing tag is always
+ * retained, so recalled text cannot forge a sibling injection block.
+ */
+export function formatHonchoMemoryBlock(
+	content: string,
+	host: string,
+	budget: number = RAW_RECALL_DEFAULT_BUDGET,
+): string {
+	const safeHost = host.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+	const opening = `<honcho-memory host="${safeHost}">`;
+	const closing = "</honcho-memory>";
+	const minimum = opening.length + closing.length + 2;
+	if (budget < minimum) {
+		throwBudgetExceeded(budget, minimum);
+	}
+	const escaped = content.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+	const room = budget - minimum;
+	const cut = safePrefixLength(escaped, Math.min(room, escaped.length));
+	return `${opening}\n${escaped.slice(0, cut)}\n${closing}`;
+}

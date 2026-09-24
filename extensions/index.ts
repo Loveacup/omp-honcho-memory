@@ -33,6 +33,7 @@ import { registerTools } from "./tools.js";
 import { registerCommands } from "./commands.js";
 import { searchWorkspaceMessages, type RawSearchResult } from "./raw-search.js";
 import { formatRawRecall, RAW_RECALL_BUDGET_EXCEEDED_CODE } from "./raw-recall.js";
+import { classifyEntry, stripInjectedUserText, type EntryClass } from "../core/source.js";
 
 interface SessionState {
 	handles: HonchoHandles | null;
@@ -170,6 +171,22 @@ function buildRawAppend(rawResult: RawSearchResult | null): string | null {
 		return RAW_UNAVAILABLE_NOTICE;
 	}
 }
+
+function classifyOmpEntry(ctx: ExtensionContext): EntryClass {
+	return classifyEntry({
+		host: "omp",
+		omp: { mode: ctx.mode, hasUI: ctx.hasUI },
+	});
+}
+
+function sourceMetadata(entryClass: EntryClass, sessionId: string): Record<string, string> {
+	return {
+		host: "omp",
+		entry_class: entryClass,
+		host_session_id: sessionId,
+	};
+}
+
 
 export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 	const sessions = new Map<SessionKey, SessionState>();
@@ -336,6 +353,7 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 		const t0 = Date.now();
 		const sessionId = getNativeSessionId(ctx);
 		if (!sessionId) return;
+		const entryClass = classifyOmpEntry(ctx);
 		log(`session_start: begin, sessionId=${sessionId} cwd=${ctx.cwd}`);
 		setStatus(ctx, "syncing");
 		const handles = await bootstrap(ctx.cwd, sessionId);
@@ -359,12 +377,14 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 			state.gitState = currentGitState;
 		}
 
-		// Upload git changes as observations (fire-and-forget).
+		// Upload git changes only for positively identified interactive sessions.
 		const externalGitChanges = gitChanges.filter((c) => c.type !== "initial");
-		if (externalGitChanges.length > 0) {
+		if (entryClass === "user_interactive" && externalGitChanges.length > 0) {
+			const metadata = sourceMetadata(entryClass, sessionId);
 			const messages = externalGitChanges.map((change) =>
 				handles.userPeer.message(`[Git External] ${change.description}`, {
 					metadata: {
+						...metadata,
 						type: "git_change",
 						change_type: change.type,
 						from: change.from,
@@ -605,6 +625,13 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 		return { systemPrompt };
 	});
 	pi.on("agent_end", async (event: AgentEndEvent, ctx) => {
+		const entryClass = classifyOmpEntry(ctx);
+		if (entryClass !== "user_interactive") {
+			log(`agent_end: ${entryClass} entry, skipping writes`);
+			return;
+		}
+		const hostSessionId = getNativeSessionId(ctx);
+		if (!hostSessionId) return;
 		const t0 = Date.now();
 		const handles = await getHandlesFromCtx(ctx);
 		if (!handles) return;
@@ -616,12 +643,14 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 		const candidates = (event.messages ?? []).flatMap((native) => {
 			const pair = collectMessagePairs([native])[0];
 			if (!pair) return [];
+			const content = pair.role === "user" ? stripInjectedUserText(pair.content) : pair.content;
+			if (!content) return [];
 			const fingerprint = createHash("sha256").update(JSON.stringify([
-				native.id ?? null, native.timestamp ?? null, native.role, native.content,
+				native.id ?? null, native.timestamp ?? null, native.role, content,
 			])).digest("hex");
 			const occurrence = (occurrences.get(fingerprint) ?? 0) + 1;
 			occurrences.set(fingerprint, occurrence);
-			return [{ ...pair, key: `${fingerprint}:${occurrence}` }];
+			return [{ ...pair, content, key: `${fingerprint}:${occurrence}` }];
 		});
 		const pairs = candidates.filter((pair) => !state.savedMessageKeys.has(pair.key));
 		if (pairs.length === 0) {
@@ -641,11 +670,12 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 			maxTokens: handles.config.messageUpload.maxAssistantTokens,
 			summarize: handles.config.messageUpload.summarizeAssistant,
 		};
+		const metadata = sourceMetadata(entryClass, hostSessionId);
 
 		for (const message of pairs) {
 			if (message.role === "user") {
 				const content = maybeTruncateContent(message.content, userUploadConfig);
-				batch.push(handles.userPeer.message(content));
+				batch.push(handles.userPeer.message(content, { metadata }));
 				const conclusion = extractDurableConclusion(content);
 				if (conclusion) {
 					// Fire-and-forget: don't block the handler.
@@ -660,7 +690,7 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 				}
 			} else {
 				const content = maybeTruncateContent(message.content, assistantUploadConfig);
-				batch.push(handles.aiPeer.message(content));
+				batch.push(handles.aiPeer.message(content, { metadata }));
 			}
 		}
 
@@ -737,16 +767,21 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		const entryClass = classifyOmpEntry(ctx);
+		const nativeSessionId = getNativeSessionId(ctx);
 		// Drain queued uploads before the session goes away. oh-my-pi caps this
 		// handler at 2s, so the flush is awaited but bounded by the host timeout.
 		await flushPending().catch(() => {});
 		setStatus(ctx, "off");
-		const handles = await getHandlesFromCtx(ctx).catch(() => null);
-		if (handles) {
+		const handles = entryClass === "user_interactive" ? await getHandlesFromCtx(ctx).catch(() => null) : null;
+		if (handles && nativeSessionId) {
 			// Best-effort session-end marker; do not await because oh-my-pi
 			// imposes a 2s handler timeout for this event.
 			const marker = handles.aiPeer.message(`[Session ended]`, {
-				metadata: { type: "session_end_marker" },
+				metadata: {
+					...sourceMetadata(entryClass, nativeSessionId),
+					type: "session_end_marker",
+				},
 			});
 			handles.session
 				.addMessages([marker])
@@ -755,7 +790,7 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 					(err: unknown) => log(`session_shutdown: end marker failed: ${String(err)}`),
 				);
 		}
-		const sessionId = getNativeSessionId(ctx);
+		const sessionId = nativeSessionId;
 		if (!sessionId) return;
 		const sessionKey = deriveSessionKey(ctx.cwd, sessionId);
 		sessions.delete(sessionKey);

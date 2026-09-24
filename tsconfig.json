@@ -13,5 +13,6 @@
     "rootDir": ".",
     "typeRoots": ["./types", "./node_modules/@types"]
   },
-	"include": ["types/**/*.d.ts", "extensions/**/*.ts", "test/**/*.ts"]
+	"include": ["types/**/*.d.ts", "core/**/*.ts", "extensions/**/*.ts", "hooks/**/*.ts", "scripts/**/*.ts", "test/**/*.ts"],
+	"exclude": ["frozen/**"]
 }

@@ -20,6 +20,8 @@ declare module "@oh-my-pi/pi-coding-agent" {
 
   export type ExtensionContext = {
     cwd: string;
+    mode: "tui" | "rpc" | "json" | "print";
+    hasUI: boolean;
     sessionManager: {
       getSessionId(): string;
       getBranch(): Array<{ type: string; customType?: string; data?: unknown }>;

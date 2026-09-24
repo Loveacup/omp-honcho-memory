@@ -1,4 +1,4 @@
-import type { HonchoHandles, HonchoMessage } from "./client.js";
+import { userConclusionObserver, userConclusionView, type HonchoHandles, type HonchoMessage } from "./client.js";
 
 // --- Async save queue: serializes Honcho uploads so multiple agent_end
 // events do not issue concurrent addMessages calls. Boundaries such as
@@ -64,9 +64,14 @@ function parseSessionSummary(value: unknown): string {
 	return typeof value === "string" && value.trim() ? value.trim() : "";
 }
 export async function hydrateMemoryContext(handles: HonchoHandles): Promise<MemoryContextBlock> {
-
+	const userObserver = userConclusionObserver(handles);
+	const userTarget = userObserver === handles.aiPeer ? handles.userPeer : undefined;
 	const [userCtx, aiCtx, summaries] = await Promise.allSettled([
-		handles.userPeer.context({ maxConclusions: 12, includeMostFrequent: true }),
+		userObserver.context({
+			...(userTarget ? { target: userTarget } : {}),
+			maxConclusions: 12,
+			includeMostFrequent: true,
+		}),
 		handles.aiPeer.context({ maxConclusions: 8, includeMostFrequent: true }),
 		handles.session.summaries(),
 	]);
@@ -422,7 +427,7 @@ export async function saveUserConclusion(
 ): Promise<{ saved: boolean; error?: string }> {
 	const trimmed = clampText(content.trim(), 25_000);
 	if (!trimmed) return { saved: false, error: "Empty content." };
-	await handles.aiPeer.conclusionsOf(handles.userPeer).create({
+	await userConclusionView(handles).create({
 		content: trimmed,
 		sessionId: handles.session.id,
 	});

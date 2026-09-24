@@ -10,6 +10,20 @@ export interface HonchoMessage {
 	createdAt?: string;
 }
 
+export interface HonchoConclusion {
+	id: string;
+	content: string;
+	observerId: string;
+	observedId: string;
+}
+
+export interface HonchoConclusionView {
+	create(params: { content: string; sessionId?: string }): Promise<unknown>;
+	get(id: string): Promise<HonchoConclusion>;
+	list(options?: { size?: number }): Promise<{ items?: HonchoConclusion[] }>;
+	delete(id: string): Promise<unknown>;
+}
+
 export interface HonchoPeer {
 	id: string;
 	message(content: string, options?: { metadata?: Record<string, unknown>; createdAt?: string }): HonchoMessage;
@@ -21,10 +35,7 @@ export interface HonchoPeer {
 		maxConclusions?: number;
 		includeMostFrequent?: boolean;
 	}): Promise<{ representation: string; peerCard: string[] | null }>;
-	conclusionsOf(targetPeer: HonchoPeer): {
-		create(params: { content: string; sessionId?: string }): Promise<unknown>;
-		delete(id: string): Promise<unknown>;
-	};
+	conclusionsOf(targetPeer: HonchoPeer): HonchoConclusionView;
 	chat(
 		query: string,
 		options?: { target?: HonchoPeer; session?: HonchoSession; reasoningLevel?: string },
@@ -63,6 +74,14 @@ export interface HonchoHandles {
 	aiPeer: HonchoPeer;
 	session: HonchoSession;
 	config: HonchoExtensionConfig;
+}
+
+export function userConclusionObserver(handles: HonchoHandles): HonchoPeer {
+	return handles.config.observationMode === "unified" ? handles.userPeer : handles.aiPeer;
+}
+
+export function userConclusionView(handles: HonchoHandles): HonchoConclusionView {
+	return userConclusionObserver(handles).conclusionsOf(handles.userPeer);
 }
 
 export async function createHonchoHandles(params: {

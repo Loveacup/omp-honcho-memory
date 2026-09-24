@@ -1,7 +1,7 @@
 <div align="center">
   <h1>🧠 OMP Honcho Memory</h1>
-  <p><strong>让 Oh My Pi 拥有可追溯、有边界的跨会话记忆</strong></p>
-  <p>基于 <a href="https://honcho.dev">Honcho</a> 的 OMP 记忆扩展：绑定原生聊天会话，在模型请求前召回相关历史，并在每轮结束后可靠写回。</p>
+  <p><strong>一个插件，让 OMP、Claude Code、Codex 与 Hermes 理解同一个你</strong></p>
+  <p>基于 <a href="https://honcho.dev">Honcho</a> 的跨 CLI 记忆插件：共享核心 + 每端薄壳，一条命令安装、升级、卸载与冒烟；在模型请求前召回相关历史，只把真人交互写成用户证据。</p>
   <p>
     <a href="https://github.com/can1357/oh-my-pi"><img src="https://img.shields.io/badge/OMP-18.2.5%2B-6f42c1?style=flat-square" alt="OMP 18.2.5+"/></a>
     <a href="https://bun.sh"><img src="https://img.shields.io/badge/Bun-1.3%2B-000000?style=flat-square&amp;logo=bun&amp;logoColor=white" alt="Bun 1.3+"/></a>
@@ -35,6 +35,9 @@
 | 🔄 **生命周期保护** | 在会话切换、压缩和关闭时刷新待处理写入 |
 | 🔔 **轻量反馈** | 使用中英双语瞬时通知，不长期占用 OMP 底部状态栏 |
 | 🧰 **可观测工具** | 提供搜索、上下文检查、结论写入和健康检查工具 |
+| 🔌 **一体化多端** | 同一包覆盖 OMP 扩展、Claude Code／Codex Hook 与 Claude 四工具 MCP；Hermes 走其原生 Honcho provider，共享同一用户与结论视图 |
+| 🤖 **机器输入排除** | 按入口判定来源：交互式真人输入才写入；headless、子代理、编排器会话（`HONCHO_AUTOMATION=1`）与宿主注入块只召回不写入，从不按消息关键词判断 |
+| 🩺 **低维护** | 宿主升级后跑 `smoke`；失败只改对应一个薄壳；接入异常时降级为无记忆，不阻塞主任务 |
 
 <a id="vision"></a>
 
@@ -42,7 +45,7 @@
 
 人在不同设备和 CLI 之间切换时，工具可以不同、会话可以独立，但不应每次都从零认识用户。理想状态是：获准接入的客户端共同使用一份**有来源、可纠正、会随时间更新**的用户认知，并只在当前任务需要时取用相关部分。
 
-本仓库实现的是这套拓扑中的 **OMP 接入端**，不是跨 CLI 控制中心。共享认知不会合并各端会话，也不会让一个客户端继承另一个客户端的工具、权限或指令。
+本仓库是这套拓扑的**一体化接入插件**，不是跨 CLI 控制中心。共享认知不会合并各端会话，也不会让一个客户端继承另一个客户端的工具、权限或指令。
 
 ```mermaid
 flowchart LR
@@ -104,6 +107,17 @@ flowchart LR
 > [!NOTE]
 > 原始召回是有界的历史证据，不是当前指令或完整数据库视图；确认式重试降低丢失风险，但不承诺 exactly-once。
 
+### 多端组成
+
+| 端 | 接入方式 | 写入 | 召回 |
+|---|---|---|---|
+| OMP | `extensions/` → `~/.omp/agent/extensions/honcho-memory.js` | 仅 `mode=tui` 且有 UI 的会话 | 每轮 system prompt 注入 |
+| Claude Code | `hooks/honcho-hook.ts`（SessionStart、UserPromptSubmit、Stop）+ `hooks/honcho-mcp.ts` 四工具 | 交互会话；带 `agent_id` 的子代理、`-p`／SDK 不写 | `additionalContext` 注入；MCP 搜索／列出／新增／删除结论 |
+| Codex | 同一 Hook（`--host codex`） | 交互会话；`exec`／`review` 等不写 | `additionalContext` 注入 |
+| Hermes | 原生 Honcho provider，仅配置（`observation.ai.observeOthers=false`、`recallSync: true`） | 由 Hermes 机器作者门排除通知、loop、heartbeat、goal 续跑 | 同步首轮召回 |
+
+所有写入消息带 `host`、`entry_class`、`host_session_id` 元数据，任一召回条目都可追到客户端、会话与时间。共享核心位于 `core/source.ts`（入口分类与注入剥离）和 `extensions/config.ts`（按宿主解析 `~/.honcho/config.json`）。
+
 ---
 
 <a id="user-guide"></a>
@@ -119,7 +133,7 @@ flowchart LR
 
 OMP 的扩展 API 可能随版本变化。每次升级 OMP 后都应重新执行本文的验证步骤。
 
-### 2. 下载与构建
+### 2. 构建
 
 ```sh
 git clone https://github.com/Loveacup/omp-honcho-memory.git
@@ -160,7 +174,8 @@ export HONCHO_API_KEY='YOUR_REAL_KEY'
 chmod 600 ~/.honcho/config.json
 ```
 
-环境变量优先于配置文件。支持：
+环境变量优先于配置文件。`HONCHO_CONFIG_DIR` 可把配置文件位置改为
+`$HONCHO_CONFIG_DIR/config.json`。其他支持项：
 
 - `HONCHO_API_KEY`
 - `HONCHO_URL`
@@ -171,40 +186,24 @@ chmod 600 ~/.honcho/config.json
 
 不要把真实 key 写入本仓库、聊天记录、截图、Issue 或公开日志。
 
-### 4. 安装到 OMP
+### 4. 一条命令安装
 
-先备份已有同名扩展，再安装新构建：
-
-```sh
-mkdir -p ~/.omp/agent/extensions
-if [ -f ~/.omp/agent/extensions/honcho-memory.js ]; then
-  cp ~/.omp/agent/extensions/honcho-memory.js \
-    ~/.omp/agent/extensions/honcho-memory.js.backup
-fi
-cp dist/index.js ~/.omp/agent/extensions/honcho-memory.js
-```
-
-重启 OMP。不要同时从项目级和用户级目录加载两份 Honcho 扩展。
-
-### 5. 首次验证
-
-先运行离线检查：
+先预览所有文件操作和 JSON 条目差异，再执行安装：
 
 ```sh
-bun run check
-bun run build
-bun run verify
+bun scripts/cognition.ts install --dry-run
+bun scripts/cognition.ts install
 ```
 
-然后使用不敏感的合成事实启动两个全新 OMP 会话：
+命令会幂等地安装 OMP 扩展与 Claude Code／Codex Hook、安装 Claude 的四工具 stdio MCP、停用 Claude 官方 Honcho writer，并备份被替换的文件和条目。Hook 与 MCP 的 manifest 会记录安装时解析出的绝对 Node 路径。它不会重启 Hermes gateway；按命令提示自行重启相关 CLI。
 
-1. 会话 A 告诉 OMP 一个明确标记为测试数据的事实。
-2. 等待出现“本轮记忆已保存”通知。
-3. 在 Honcho 中确认用户消息和助手消息的作者 Peer、Session 与内容正确。
-4. 会话 B 询问相关问题，但不要在问题中包含答案。
-5. 确认 OMP 自动载入相关记忆，并且没有混入其他用户或 workspace 的内容。
+### 5. 验证
 
-仅看到模型回答正确，不足以证明捕获和召回链路通过；还要核对 Honcho 远端记录。
+```sh
+bun scripts/cognition.ts smoke
+```
+
+`smoke` 不写入 Honcho；它核对安装 hash、唯一 Hook writer、Claude MCP 注册、MCP 的四工具清单、配置是否可解析，并以 `--dry-run` 合成载荷调用 Hook 与 MCP。manifest 中的 Node 路径丢失时，受影响的宿主报告 `DEGRADED`。正式跨会话验收仍应只使用不敏感的合成事实，并在 Honcho 中核对作者 Peer、Session、来源 metadata 与内容。
 
 ### 6. 界面提示
 
@@ -227,28 +226,21 @@ git pull --ff-only
 bun install --frozen-lockfile
 bun run check
 bun run build
-bun run verify
-cp dist/index.js ~/.omp/agent/extensions/honcho-memory.js
+bun scripts/cognition.ts upgrade --dry-run
+bun scripts/cognition.ts upgrade
+bun scripts/cognition.ts smoke
 ```
 
-完成后重启 OMP，并至少执行一次合成数据捕获与跨会话召回。
+每次 OMP、Claude Code、Codex 或 Hermes 更新后都运行一次 `smoke`；失败时只修对应薄壳，不增加旁路 writer。
 
 ### 8. 回滚或卸载
 
-恢复备份：
-
 ```sh
-cp ~/.omp/agent/extensions/honcho-memory.js.backup \
-  ~/.omp/agent/extensions/honcho-memory.js
+bun scripts/cognition.ts uninstall --dry-run
+bun scripts/cognition.ts uninstall
 ```
 
-或卸载：
-
-```sh
-rm ~/.omp/agent/extensions/honcho-memory.js
-```
-
-随后重启 OMP。卸载本地扩展不会自动删除已经写入 Honcho 的远端数据。
+卸载按最新 manifest 做冲突检测和外科式还原；若目标自安装后被修改，它会明确失败而不会覆盖。卸载本地插件不会删除已经写入 Honcho 的远端数据。
 
 ---
 
