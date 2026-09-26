@@ -34,6 +34,7 @@ import { registerCommands } from "./commands.js";
 import { searchWorkspaceMessages, type RawSearchResult } from "./raw-search.js";
 import { formatRawRecall, RAW_RECALL_BUDGET_EXCEEDED_CODE } from "./raw-recall.js";
 import { classifyEntry, stripInjectedUserText, type EntryClass } from "../core/source.js";
+import { MessageAckStore, nativeMessageKey } from "./message-ack.js";
 
 interface SessionState {
 	handles: HonchoHandles | null;
@@ -46,7 +47,7 @@ interface SessionState {
 	recentConclusions: string[];
 	/** Set to true after session_start finishes loading memory */
 	memoryReady: boolean;
-	/** Acknowledged native messages only; retained across compaction. */
+	/** Acknowledged native messages, hydrated from durable per-session receipts. */
 	savedMessageKeys: Set<string>;
 	agentEndSave: Promise<void> | null;
 	/** Cached git state for this session */
@@ -192,6 +193,7 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 	const sessions = new Map<SessionKey, SessionState>();
 	const bootstrapLocks = new Map<SessionKey, Promise<HonchoHandles | null>>();
 	const uiStates = new Map<string, { connectedAnnounced: boolean; offline: boolean }>();
+	const messageAcks = new MessageAckStore();
 
 	function setStatus(ctx: ExtensionContext, state: "off" | "connected" | "syncing" | "offline" | undefined): void {
 		// Keep Honcho out of the persistent bottom status bar. OMP has no dedicated
@@ -636,8 +638,9 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 		const handles = await getHandlesFromCtx(ctx);
 		if (!handles) return;
 		setStatus(ctx, "syncing");
-
 		const state = getState(handles.sessionId);
+
+		for (const key of messageAcks.load(hostSessionId)) state.savedMessageKeys.add(key);
 		while (state.agentEndSave) await state.agentEndSave;
 		const occurrences = new Map<string, number>();
 		const candidates = (event.messages ?? []).flatMap((native) => {
@@ -645,14 +648,14 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 			if (!pair) return [];
 			const content = pair.role === "user" ? stripInjectedUserText(pair.content) : pair.content;
 			if (!content) return [];
-			const fingerprint = createHash("sha256").update(JSON.stringify([
-				native.id ?? null, native.timestamp ?? null, native.role, content,
-			])).digest("hex");
+			const normalized = { ...native, role: pair.role, content };
+			const fingerprint = nativeMessageKey(normalized, 0);
 			const occurrence = (occurrences.get(fingerprint) ?? 0) + 1;
 			occurrences.set(fingerprint, occurrence);
-			return [{ ...pair, content, key: `${fingerprint}:${occurrence}` }];
+			return [{ ...pair, content, key: nativeMessageKey(normalized, occurrence) }];
 		});
-		const pairs = candidates.filter((pair) => !state.savedMessageKeys.has(pair.key));
+		const pendingKeys = new Set(messageAcks.pending(hostSessionId, candidates.map((pair) => pair.key)));
+		const pairs = candidates.filter((pair) => pendingKeys.has(pair.key) && !state.savedMessageKeys.has(pair.key));
 		if (pairs.length === 0) {
 			setStatus(ctx, "connected");
 			return;
@@ -700,8 +703,10 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 			ctx.ui.notify("↑ 正在保存本轮记忆 · Saving turn memory", "info");
 			const save = queueMessageBatch(handles, batch).then(
 				() => {
+					if (!messageAcks.acknowledge(hostSessionId, pairs.map((pair) => pair.key))) {
+						log(`agent_end: durable acknowledgement write failed for session ${hostSessionId}`);
+					}
 					for (const pair of pairs) state.savedMessageKeys.add(pair.key);
-					state.lastUserTurnCount += newUserTurns;
 					log(`agent_end: batch saved in ${Date.now() - t0}ms`);
 					setStatus(ctx, "connected");
 					ctx.ui.notify("✓ 本轮记忆已保存 · Turn memory saved", "success");
