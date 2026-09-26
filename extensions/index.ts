@@ -23,7 +23,6 @@ import {
 	type MemoryContextBlock,
 } from "./memory.js";
 import {
-	collectMessagePairs,
 	collectToolSummary,
 	extractDurableConclusion,
 	maybeTruncateContent,
@@ -33,8 +32,9 @@ import { registerTools } from "./tools.js";
 import { registerCommands } from "./commands.js";
 import { searchWorkspaceMessages, type RawSearchResult } from "./raw-search.js";
 import { formatRawRecall, RAW_RECALL_BUDGET_EXCEEDED_CODE } from "./raw-recall.js";
-import { classifyEntry, stripInjectedUserText, type EntryClass } from "../core/source.js";
-import { MessageAckStore, nativeMessageKey } from "./message-ack.js";
+import { classifyEntry, type EntryClass } from "../core/source.js";
+import { MessageAckStore } from "./message-ack.js";
+import { captureNativeMessages } from "./message-capture.js";
 
 interface SessionState {
 	handles: HonchoHandles | null;
@@ -47,6 +47,8 @@ interface SessionState {
 	recentConclusions: string[];
 	/** Set to true after session_start finishes loading memory */
 	memoryReady: boolean;
+	/** OMP/native history before this process first observed the session. */
+	legacySeedBoundary: number | null;
 	/** Acknowledged native messages, hydrated from durable per-session receipts. */
 	savedMessageKeys: Set<string>;
 	agentEndSave: Promise<void> | null;
@@ -64,6 +66,7 @@ function createSessionState(): SessionState {
 		lastUserTurnCount: 0,
 		recentConclusions: [],
 		memoryReady: false,
+		legacySeedBoundary: null,
 		savedMessageKeys: new Set(),
 		agentEndSave: null,
 		gitState: null,
@@ -71,6 +74,7 @@ function createSessionState(): SessionState {
 }
 const CONTEXT_FETCH_TIMEOUT_MS = 4000;
 const HYDRATE_TIMEOUT_MS = 8000;
+const EXTENSION_STARTED_AT = Date.now();
 
 const LOG_FILE = "/tmp/honcho-plugin.log";
 function log(msg: string): void {
@@ -352,6 +356,7 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
+		const observedAt = Date.now();
 		const t0 = Date.now();
 		const sessionId = getNativeSessionId(ctx);
 		if (!sessionId) return;
@@ -367,6 +372,7 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 		log(`session_start: bootstrap done in ${Date.now() - t0}ms`);
 		setStatus(ctx, "connected");
 		const state = getState(handles.sessionId);
+		state.legacySeedBoundary ??= observedAt;
 
 		// Capture git state and detect external changes (Claude pattern).
 		const { captureGitState, detectGitChanges, getRecentCommits, isGitRepo, inferFeatureContext } = await import("./git.js");
@@ -449,6 +455,7 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
+		const observedAt = Date.now();
 		// Drain any queued uploads from the previous session before switching.
 		await flushPending().catch(() => {});
 		setStatus(ctx, "syncing");
@@ -458,6 +465,7 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		const state = getState(handles.sessionId);
+		state.legacySeedBoundary ??= observedAt;
 		state.contextCache = { block: null, queriedAt: 0, messageCount: 0 };
 		state.lastPromptContextQuery = null;
 		state.messageCount = 0;
@@ -640,93 +648,79 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 		setStatus(ctx, "syncing");
 		const state = getState(handles.sessionId);
 
-		for (const key of messageAcks.load(hostSessionId)) state.savedMessageKeys.add(key);
+		state.legacySeedBoundary ??= EXTENSION_STARTED_AT;
 		while (state.agentEndSave) await state.agentEndSave;
-		const occurrences = new Map<string, number>();
-		const candidates = (event.messages ?? []).flatMap((native) => {
-			const pair = collectMessagePairs([native])[0];
-			if (!pair) return [];
-			const content = pair.role === "user" ? stripInjectedUserText(pair.content) : pair.content;
-			if (!content) return [];
-			const normalized = { ...native, role: pair.role, content };
-			const fingerprint = nativeMessageKey(normalized, 0);
-			const occurrence = (occurrences.get(fingerprint) ?? 0) + 1;
-			occurrences.set(fingerprint, occurrence);
-			return [{ ...pair, content, key: nativeMessageKey(normalized, occurrence) }];
-		});
-		const pendingKeys = new Set(messageAcks.pending(hostSessionId, candidates.map((pair) => pair.key)));
-		const pairs = candidates.filter((pair) => pendingKeys.has(pair.key) && !state.savedMessageKeys.has(pair.key));
-		if (pairs.length === 0) {
-			setStatus(ctx, "connected");
-			return;
-		}
+		let newUserTurns = 0;
+		const save = captureNativeMessages(
+			hostSessionId,
+			event.messages ?? [],
+			{
+				savedMessageKeys: state.savedMessageKeys,
+				legacySeedBoundary: state.legacySeedBoundary,
+			},
+			messageAcks,
+			async (pairs) => {
+				log(`agent_end: begin, ${pairs.length} pairs`);
+				newUserTurns = pairs.filter((pair) => pair.role === "user").length;
+				const batch: HonchoMessage[] = [];
+				const userUploadConfig = { maxTokens: handles.config.messageUpload.maxUserTokens };
+				const assistantUploadConfig = {
+					maxTokens: handles.config.messageUpload.maxAssistantTokens,
+					summarize: handles.config.messageUpload.summarizeAssistant,
+				};
+				const metadata = sourceMetadata(entryClass, hostSessionId);
 
-		log(`agent_end: begin, ${pairs.length} pairs`);
-		const newUserTurns = pairs.filter((p) => p.role === "user").length;
-
-		// Build all messages locally (instant, no I/O).
-		const batch: HonchoMessage[] = [];
-		const userUploadConfig = {
-			maxTokens: handles.config.messageUpload.maxUserTokens,
-		};
-		const assistantUploadConfig = {
-			maxTokens: handles.config.messageUpload.maxAssistantTokens,
-			summarize: handles.config.messageUpload.summarizeAssistant,
-		};
-		const metadata = sourceMetadata(entryClass, hostSessionId);
-
-		for (const message of pairs) {
-			if (message.role === "user") {
-				const content = maybeTruncateContent(message.content, userUploadConfig);
-				batch.push(handles.userPeer.message(content, { metadata }));
-				const conclusion = extractDurableConclusion(content);
-				if (conclusion) {
-					// Fire-and-forget: don't block the handler.
-					saveUserConclusion(handles, conclusion)
-						.then((result) => {
-							if (result.saved) {
-								state.recentConclusions.unshift(conclusion);
-								if (state.recentConclusions.length > 10) state.recentConclusions.length = 10;
-							}
-						})
-						.catch(() => {});
-				}
-			} else {
-				const content = maybeTruncateContent(message.content, assistantUploadConfig);
-				batch.push(handles.aiPeer.message(content, { metadata }));
-			}
-		}
-
-		// Enqueue upload so concurrent agent_end events do not issue parallel
-		// addMessages calls. Lifecycle boundaries call flushPending() to drain.
-		if (handles.config.saveMessages !== false) {
-			ctx.ui.notify("↑ 正在保存本轮记忆 · Saving turn memory", "info");
-			const save = queueMessageBatch(handles, batch).then(
-				() => {
-					if (!messageAcks.acknowledge(hostSessionId, pairs.map((pair) => pair.key))) {
-						log(`agent_end: durable acknowledgement write failed for session ${hostSessionId}`);
+				for (const message of pairs) {
+					if (message.role === "user") {
+						const content = maybeTruncateContent(message.content, userUploadConfig);
+						batch.push(handles.userPeer.message(content, { metadata }));
+						const conclusion = extractDurableConclusion(content);
+						if (conclusion) {
+							saveUserConclusion(handles, conclusion)
+								.then((result) => {
+									if (result.saved) {
+										state.recentConclusions.unshift(conclusion);
+										if (state.recentConclusions.length > 10) state.recentConclusions.length = 10;
+									}
+								})
+								.catch(() => {});
+						}
+					} else {
+						const content = maybeTruncateContent(message.content, assistantUploadConfig);
+						batch.push(handles.aiPeer.message(content, { metadata }));
 					}
-					for (const pair of pairs) state.savedMessageKeys.add(pair.key);
-					log(`agent_end: batch saved in ${Date.now() - t0}ms`);
-					setStatus(ctx, "connected");
-					ctx.ui.notify("✓ 本轮记忆已保存 · Turn memory saved", "success");
-				},
-				(err: unknown) => {
-					// Retry only when messages reappear in agent_end; no cursor advance.
-					// Ambiguous remote success can duplicate on replay (no server idempotency).
-					log(`agent_end: batch failed: ${String(err)}`);
-					setStatus(ctx, "offline");
-				},
-			);
-			state.agentEndSave = save;
-			try { await save; } finally {
-				if (state.agentEndSave === save) state.agentEndSave = null;
-			}
-		} else {
-			log(`agent_end: saveMessages disabled, skipping batch upload`);
-			setStatus(ctx, "connected");
-		}
+				}
 
+				if (handles.config.saveMessages === false) {
+					log(`agent_end: saveMessages disabled, skipping batch upload`);
+					setStatus(ctx, "connected");
+					return false;
+				}
+				ctx.ui.notify("↑ 正在保存本轮记忆 · Saving turn memory", "info");
+				await queueMessageBatch(handles, batch);
+				return true;
+			},
+			() => log(`agent_end: durable acknowledgement write failed for session ${hostSessionId}`),
+		).then(
+			(pairs) => {
+				if (pairs.length === 0) {
+					setStatus(ctx, "connected");
+					return;
+				}
+				state.lastUserTurnCount += newUserTurns;
+				log(`agent_end: batch saved in ${Date.now() - t0}ms`);
+				setStatus(ctx, "connected");
+				ctx.ui.notify("✓ 本轮记忆已保存 · Turn memory saved", "success");
+			},
+			(err: unknown) => {
+				log(`agent_end: batch failed: ${String(err)}`);
+				setStatus(ctx, "offline");
+			},
+		);
+		state.agentEndSave = save;
+		try { await save; } finally {
+			if (state.agentEndSave === save) state.agentEndSave = null;
+		}
 		log(`agent_end: DONE total=${Date.now() - t0}ms`);
 	});
 	pi.on("session_before_compact", async (_event, ctx) => {

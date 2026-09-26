@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -50,6 +50,25 @@ export class MessageAckStore {
 	pending(sessionId: string, keys: readonly string[]): string[] {
 		const acknowledged = this.load(sessionId);
 		return keys.filter((key) => !acknowledged.has(key));
+	}
+	hasReceiptFile(sessionId: string): boolean {
+		return existsSync(this.sessionFile(sessionId));
+	}
+
+	/** Mark pre-upgrade history acknowledged only when this session has no receipt file. */
+	seedLegacy(sessionId: string, keys: readonly string[]): boolean {
+		if (this.hasReceiptFile(sessionId)) return false;
+		if (keys.length === 0) return true;
+		try {
+			mkdirSync(this.directory, { recursive: true });
+			appendFileSync(this.sessionFile(sessionId), keys.map((key) => `${JSON.stringify(key)}\n`).join(""), { encoding: "utf8", flag: "wx" });
+			const known = this.loaded.get(sessionId) ?? new Set<string>();
+			for (const key of keys) known.add(key);
+			this.loaded.set(sessionId, known);
+			return true;
+		} catch {
+			return false;
+		}
 	}
 
 	has(sessionId: string, key: string): boolean {
