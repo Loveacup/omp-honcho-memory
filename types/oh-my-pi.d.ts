@@ -24,7 +24,14 @@ declare module "@oh-my-pi/pi-coding-agent" {
     hasUI: boolean;
     sessionManager: {
       getSessionId(): string;
-      getBranch(): Array<{ type: string; customType?: string; data?: unknown }>;
+      getBranch(): Array<{
+        type: string;
+        customType?: string;
+        data?: unknown;
+        id?: string;
+        timestamp?: string;
+        message?: AgentMessage;
+      }>;
     };
     ui: {
       notify(message: string, level?: "info" | "warning" | "error" | "success"): void;

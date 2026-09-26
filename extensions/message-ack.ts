@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -13,7 +13,7 @@ export interface NativeMessageIdentity {
 /** Stable identity for one native event; repeated text in a new event stays distinct. */
 export function nativeMessageKey(message: NativeMessageIdentity, occurrence: number): string {
 	const identity = message.id
-		? [message.id, message.timestamp ?? null, message.role]
+		? [message.id, message.role]
 		: [null, message.timestamp ?? null, message.role, message.content];
 	return createHash("sha256").update(JSON.stringify([identity, occurrence])).digest("hex");
 }
@@ -55,13 +55,12 @@ export class MessageAckStore {
 		return existsSync(this.sessionFile(sessionId));
 	}
 
-	/** Mark pre-upgrade history acknowledged only when this session has no receipt file. */
+	/** Initialize a native-session receipt once; an empty key list still writes its marker. */
 	seedLegacy(sessionId: string, keys: readonly string[]): boolean {
 		if (this.hasReceiptFile(sessionId)) return false;
-		if (keys.length === 0) return true;
 		try {
 			mkdirSync(this.directory, { recursive: true });
-			appendFileSync(this.sessionFile(sessionId), keys.map((key) => `${JSON.stringify(key)}\n`).join(""), { encoding: "utf8", flag: "wx" });
+			writeFileSync(this.sessionFile(sessionId), keys.map((key) => `${JSON.stringify(key)}\n`).join(""), { encoding: "utf8", flag: "wx" });
 			const known = this.loaded.get(sessionId) ?? new Set<string>();
 			for (const key of keys) known.add(key);
 			this.loaded.set(sessionId, known);

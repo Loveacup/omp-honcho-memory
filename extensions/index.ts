@@ -34,7 +34,7 @@ import { searchWorkspaceMessages, type RawSearchResult } from "./raw-search.js";
 import { formatRawRecall, RAW_RECALL_BUDGET_EXCEEDED_CODE } from "./raw-recall.js";
 import { classifyEntry, type EntryClass } from "../core/source.js";
 import { MessageAckStore } from "./message-ack.js";
-import { captureNativeMessages } from "./message-capture.js";
+import { captureNativeMessages, NativeHistorySnapshots, type NativeBranchEntry } from "./message-capture.js";
 
 interface SessionState {
 	handles: HonchoHandles | null;
@@ -47,8 +47,6 @@ interface SessionState {
 	recentConclusions: string[];
 	/** Set to true after session_start finishes loading memory */
 	memoryReady: boolean;
-	/** OMP/native history before this process first observed the session. */
-	legacySeedBoundary: number | null;
 	/** Acknowledged native messages, hydrated from durable per-session receipts. */
 	savedMessageKeys: Set<string>;
 	agentEndSave: Promise<void> | null;
@@ -66,7 +64,6 @@ function createSessionState(): SessionState {
 		lastUserTurnCount: 0,
 		recentConclusions: [],
 		memoryReady: false,
-		legacySeedBoundary: null,
 		savedMessageKeys: new Set(),
 		agentEndSave: null,
 		gitState: null,
@@ -74,7 +71,6 @@ function createSessionState(): SessionState {
 }
 const CONTEXT_FETCH_TIMEOUT_MS = 4000;
 const HYDRATE_TIMEOUT_MS = 8000;
-const EXTENSION_STARTED_AT = Date.now();
 
 const LOG_FILE = "/tmp/honcho-plugin.log";
 function log(msg: string): void {
@@ -199,6 +195,7 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 	const uiStates = new Map<string, { connectedAnnounced: boolean; offline: boolean }>();
 	const messageAcks = new MessageAckStore();
 
+	const nativeHistorySnapshots = new NativeHistorySnapshots();
 	function setStatus(ctx: ExtensionContext, state: "off" | "connected" | "syncing" | "offline" | undefined): void {
 		// Keep Honcho out of the persistent bottom status bar. OMP has no dedicated
 		// secondary status surface, and setTitle would fight the existing Orca
@@ -292,6 +289,17 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 			return null;
 		}
 	}
+	function observeNativeHistory(sessionId: string, ctx: ExtensionContext): ReadonlySet<string> {
+		let entries: NativeBranchEntry[] = [];
+		try {
+			entries = ctx.sessionManager.getBranch?.() ?? [];
+		} catch (err) {
+			log(`legacy snapshot: getBranch failed for ${sessionId}: ${String(err)}`);
+		}
+		return nativeHistorySnapshots.observe(sessionId, entries, messageAcks, () =>
+			log(`legacy snapshot: receipt initialization failed for session ${sessionId}`),
+		);
+	}
 
 	async function getHandlesFromCtx(ctx: ExtensionContext): Promise<HonchoHandles | null> {
 		const sessionId = getNativeSessionId(ctx);
@@ -356,11 +364,11 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
-		const observedAt = Date.now();
 		const t0 = Date.now();
 		const sessionId = getNativeSessionId(ctx);
 		if (!sessionId) return;
 		const entryClass = classifyOmpEntry(ctx);
+		if (entryClass === "user_interactive") observeNativeHistory(sessionId, ctx);
 		log(`session_start: begin, sessionId=${sessionId} cwd=${ctx.cwd}`);
 		setStatus(ctx, "syncing");
 		const handles = await bootstrap(ctx.cwd, sessionId);
@@ -372,7 +380,6 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 		log(`session_start: bootstrap done in ${Date.now() - t0}ms`);
 		setStatus(ctx, "connected");
 		const state = getState(handles.sessionId);
-		state.legacySeedBoundary ??= observedAt;
 
 		// Capture git state and detect external changes (Claude pattern).
 		const { captureGitState, detectGitChanges, getRecentCommits, isGitRepo, inferFeatureContext } = await import("./git.js");
@@ -455,7 +462,8 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
-		const observedAt = Date.now();
+		const sessionId = getNativeSessionId(ctx);
+		if (sessionId && classifyOmpEntry(ctx) === "user_interactive") observeNativeHistory(sessionId, ctx);
 		// Drain any queued uploads from the previous session before switching.
 		await flushPending().catch(() => {});
 		setStatus(ctx, "syncing");
@@ -465,7 +473,6 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		const state = getState(handles.sessionId);
-		state.legacySeedBoundary ??= observedAt;
 		state.contextCache = { block: null, queriedAt: 0, messageCount: 0 };
 		state.lastPromptContextQuery = null;
 		state.messageCount = 0;
@@ -642,22 +649,20 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 		}
 		const hostSessionId = getNativeSessionId(ctx);
 		if (!hostSessionId) return;
+		const legacySnapshot = observeNativeHistory(hostSessionId, ctx);
 		const t0 = Date.now();
 		const handles = await getHandlesFromCtx(ctx);
 		if (!handles) return;
 		setStatus(ctx, "syncing");
 		const state = getState(handles.sessionId);
 
-		state.legacySeedBoundary ??= EXTENSION_STARTED_AT;
 		while (state.agentEndSave) await state.agentEndSave;
 		let newUserTurns = 0;
 		const save = captureNativeMessages(
 			hostSessionId,
 			event.messages ?? [],
-			{
-				savedMessageKeys: state.savedMessageKeys,
-				legacySeedBoundary: state.legacySeedBoundary,
-			},
+			{ savedMessageKeys: state.savedMessageKeys },
+			legacySnapshot,
 			messageAcks,
 			async (pairs) => {
 				log(`agent_end: begin, ${pairs.length} pairs`);
@@ -793,6 +798,7 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 		if (!sessionId) return;
 		const sessionKey = deriveSessionKey(ctx.cwd, sessionId);
 		sessions.delete(sessionKey);
+		nativeHistorySnapshots.delete(sessionId);
 	});
 
 	registerTools(pi, { getHandles: getHandlesFromCtx });
