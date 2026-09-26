@@ -34,7 +34,7 @@ import { searchWorkspaceMessages, type RawSearchResult } from "./raw-search.js";
 import { formatRawRecall, RAW_RECALL_BUDGET_EXCEEDED_CODE } from "./raw-recall.js";
 import { classifyEntry, type EntryClass } from "../core/source.js";
 import { MessageAckStore } from "./message-ack.js";
-import { captureNativeMessages, NativeHistorySnapshots, type NativeBranchEntry } from "./message-capture.js";
+import { captureNativeMessages, NativeHistorySnapshots, observeNativeHistoryAtLifecycle } from "./message-capture.js";
 
 interface SessionState {
 	handles: HonchoHandles | null;
@@ -289,15 +289,17 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 			return null;
 		}
 	}
-	function observeNativeHistory(sessionId: string, ctx: ExtensionContext): ReadonlySet<string> {
-		let entries: NativeBranchEntry[] = [];
-		try {
-			entries = ctx.sessionManager.getBranch?.() ?? [];
-		} catch (err) {
-			log(`legacy snapshot: getBranch failed for ${sessionId}: ${String(err)}`);
-		}
-		return nativeHistorySnapshots.observe(sessionId, entries, messageAcks, () =>
-			log(`legacy snapshot: receipt initialization failed for session ${sessionId}`),
+	function observeNativeHistory(sessionId: string, ctx: ExtensionContext): ReadonlySet<string> | undefined {
+		const getBranch = typeof ctx.sessionManager.getBranch === "function"
+			? () => ctx.sessionManager.getBranch()
+			: undefined;
+		return observeNativeHistoryAtLifecycle(
+			sessionId,
+			getBranch,
+			nativeHistorySnapshots,
+			messageAcks,
+			(error) => log(`legacy snapshot: getBranch failed for ${sessionId}: ${String(error)}`),
+			() => log(`legacy snapshot: receipt initialization failed for session ${sessionId}`),
 		);
 	}
 
@@ -649,7 +651,6 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 		}
 		const hostSessionId = getNativeSessionId(ctx);
 		if (!hostSessionId) return;
-		const legacySnapshot = observeNativeHistory(hostSessionId, ctx);
 		const t0 = Date.now();
 		const handles = await getHandlesFromCtx(ctx);
 		if (!handles) return;
@@ -662,7 +663,6 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 			hostSessionId,
 			event.messages ?? [],
 			{ savedMessageKeys: state.savedMessageKeys },
-			legacySnapshot,
 			messageAcks,
 			async (pairs) => {
 				log(`agent_end: begin, ${pairs.length} pairs`);

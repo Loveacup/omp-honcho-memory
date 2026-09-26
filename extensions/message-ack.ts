@@ -10,8 +10,16 @@ export interface NativeMessageIdentity {
 	content: string;
 }
 
-/** Stable identity for one native event; repeated text in a new event stays distinct. */
+/** Deployed r1 durable identity; new receipts must continue using this format. */
 export function nativeMessageKey(message: NativeMessageIdentity, occurrence: number): string {
+	const identity = message.id
+		? [message.id, message.timestamp ?? null, message.role]
+		: [null, message.timestamp ?? null, message.role, message.content];
+	return createHash("sha256").update(JSON.stringify([identity, occurrence])).digest("hex");
+}
+
+/** r2 compatibility identity, read-only after the r1 key-format restoration. */
+export function nativeMessageKeyR2(message: NativeMessageIdentity, occurrence: number): string {
 	const identity = message.id
 		? [message.id, message.role]
 		: [null, message.timestamp ?? null, message.role, message.content];

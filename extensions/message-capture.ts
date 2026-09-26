@@ -1,6 +1,6 @@
 import { collectMessagePairs } from "./message-utils.js";
 import { stripInjectedUserText } from "../core/source.js";
-import { MessageAckStore, nativeMessageKey } from "./message-ack.js";
+import { MessageAckStore, nativeMessageKey, nativeMessageKeyR2 } from "./message-ack.js";
 
 export interface NativeCaptureInput {
 	id?: unknown;
@@ -28,10 +28,14 @@ export interface NativeBranchEntry {
 
 interface Candidate {
 	pair: NativeCapturePair;
+	receiptKeys: readonly string[];
 }
-
 function candidatesFromMessages(messages: readonly NativeCaptureInput[]): Candidate[] {
-	const occurrences = new Map<string, number>();
+
+	// Count duplicates in each ordered full-history input; snapshots and agent_end both see
+	// session history. Native millisecond timestamps keep same-ID r1 occurrence groups stable.
+	const r1Occurrences = new Map<string, number>();
+	const r2Occurrences = new Map<string, number>();
 	const candidates: Candidate[] = [];
 	for (const native of messages) {
 		const pair = collectMessagePairs([native])[0];
@@ -44,24 +48,26 @@ function candidatesFromMessages(messages: readonly NativeCaptureInput[]): Candid
 			role: pair.role,
 			content,
 		};
-		const fingerprint = nativeMessageKey(normalized, 0);
-		const occurrence = (occurrences.get(fingerprint) ?? 0) + 1;
-		occurrences.set(fingerprint, occurrence);
-		candidates.push({ pair: { ...pair, content, key: nativeMessageKey(normalized, occurrence) } });
+		const r1Fingerprint = nativeMessageKey(normalized, 0);
+		const r1Occurrence = (r1Occurrences.get(r1Fingerprint) ?? 0) + 1;
+		r1Occurrences.set(r1Fingerprint, r1Occurrence);
+		const r2Fingerprint = nativeMessageKeyR2(normalized, 0);
+		const r2Occurrence = (r2Occurrences.get(r2Fingerprint) ?? 0) + 1;
+		r2Occurrences.set(r2Fingerprint, r2Occurrence);
+		const key = nativeMessageKey(normalized, r1Occurrence);
+		candidates.push({
+			pair: { ...pair, content, key },
+			receiptKeys: [key, nativeMessageKeyR2(normalized, r2Occurrence)],
+		});
 	}
 	return candidates;
 }
 
+/** Build migration identities from message payloads only, matching agent_end normalization. */
 export function snapshotNativeHistory(entries: readonly NativeBranchEntry[]): Set<string> {
-	const messages: NativeCaptureInput[] = [];
-	for (const entry of entries) {
-		if (entry.type !== "message" || !entry.message) continue;
-		messages.push({
-			...entry.message,
-			id: typeof entry.id === "string" ? entry.id : entry.message.id,
-			timestamp: entry.message.timestamp ?? entry.timestamp,
-		});
-	}
+	const messages = entries
+		.filter((entry) => entry.type === "message" && entry.message)
+		.map((entry) => entry.message!);
 	return new Set(candidatesFromMessages(messages).map((candidate) => candidate.pair.key));
 }
 
@@ -75,10 +81,11 @@ export class NativeHistorySnapshots {
 
 	observe(
 		sessionId: string,
-		entries: readonly NativeBranchEntry[],
+		entries: readonly NativeBranchEntry[] | null | undefined,
 		acknowledgements: MessageAckStore,
 		onSeedFailure?: () => void,
-	): ReadonlySet<string> {
+	): ReadonlySet<string> | undefined {
+		if (!entries) return undefined;
 		if (!this.snapshots.has(sessionId)) {
 			const hasReceiptFile = acknowledgements.hasReceiptFile(sessionId);
 			const snapshot = hasReceiptFile ? new Set<string>() : snapshotNativeHistory(entries);
@@ -88,10 +95,29 @@ export class NativeHistorySnapshots {
 		return this.snapshots.get(sessionId)!;
 	}
 
-
 	delete(sessionId: string): void {
 		this.snapshots.delete(sessionId);
 	}
+}
+
+/** Observe only when a lifecycle caller can successfully read the native branch. */
+export function observeNativeHistoryAtLifecycle(
+	sessionId: string,
+	getBranch: (() => readonly NativeBranchEntry[]) | undefined,
+	snapshots: NativeHistorySnapshots,
+	acknowledgements: MessageAckStore,
+	onReadFailure?: (error: unknown) => void,
+	onSeedFailure?: () => void,
+): ReadonlySet<string> | undefined {
+	if (!getBranch) return undefined;
+	let entries: readonly NativeBranchEntry[];
+	try {
+		entries = getBranch();
+	} catch (error) {
+		onReadFailure?.(error);
+		return undefined;
+	}
+	return snapshots.observe(sessionId, entries, acknowledgements, onSeedFailure);
 }
 
 /** The production agent_end capture path; upload is injected so tests use fakes. */
@@ -99,25 +125,19 @@ export async function captureNativeMessages(
 	sessionId: string,
 	messages: readonly NativeCaptureInput[],
 	state: NativeCaptureState,
-	legacySnapshot: ReadonlySet<string>,
 	acknowledgements: MessageAckStore,
 	upload: (pairs: NativeCapturePair[]) => Promise<boolean>,
 	onAcknowledgementFailure?: () => void,
 ): Promise<NativeCapturePair[]> {
 	const candidates = candidatesFromMessages(messages);
-	if (!acknowledgements.hasReceiptFile(sessionId)) {
-		const seededKeys = candidates
-			.map((candidate) => candidate.pair.key)
-			.filter((key) => legacySnapshot.has(key));
-		acknowledgements.seedLegacy(sessionId, seededKeys);
-		for (const key of seededKeys) state.savedMessageKeys.add(JSON.stringify([sessionId, key]));
-	}
-
-	const candidatePairs = candidates.map((candidate) => candidate.pair);
-	const pendingKeys = new Set(acknowledgements.pending(sessionId, candidatePairs.map((pair) => pair.key)));
-	const pairs = candidatePairs.filter((pair) =>
-		pendingKeys.has(pair.key) && !state.savedMessageKeys.has(JSON.stringify([sessionId, pair.key])),
-	);
+	const acknowledged = acknowledgements.load(sessionId);
+	const pairs = candidates
+		.filter((candidate) =>
+			!candidate.receiptKeys.some((key) =>
+				acknowledged.has(key) || state.savedMessageKeys.has(JSON.stringify([sessionId, key])),
+			),
+		)
+		.map((candidate) => candidate.pair);
 	if (pairs.length === 0) return pairs;
 
 	const uploaded = await upload(pairs);
