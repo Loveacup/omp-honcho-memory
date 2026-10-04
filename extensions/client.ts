@@ -1,5 +1,6 @@
 import { Honcho } from "@honcho-ai/sdk";
 import type { HonchoExtensionConfig } from "./config.js";
+import { attachIsolatedHonchoTelemetry, type IsolatedRun } from "./isolated-run.js";
 
 export type SessionKey = string;
 
@@ -87,13 +88,15 @@ export function userConclusionView(handles: HonchoHandles): HonchoConclusionView
 export async function createHonchoHandles(params: {
 	config: HonchoExtensionConfig;
 	sessionKey: SessionKey;
+	isolatedRun?: IsolatedRun | null;
 }): Promise<HonchoHandles> {
 	const honcho = new Honcho({
 		apiKey: params.config.apiKey || undefined,
 		baseURL: params.config.url || undefined,
 		workspaceId: params.config.workspace,
+		maxRetries: 0,
 	});
-
+	if (params.isolatedRun) attachIsolatedHonchoTelemetry(honcho, params.isolatedRun);
 	// Peer IDs are configured identities, not display names to normalize.
 	const userPeerId = params.config.peerName;
 	const aiPeerId = params.config.aiPeer;

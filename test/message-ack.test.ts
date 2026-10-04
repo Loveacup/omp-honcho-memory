@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MessageAckStore, nativeMessageKey, nativeMessageKeyR2 } from "../extensions/message-ack.js";
@@ -45,13 +45,14 @@ async function captureUploads(
 	state: NativeCaptureState,
 	_snapshot: ReadonlySet<string> | undefined,
 	store: MessageAckStore,
+	branchEntries?: readonly NativeBranchEntry[],
 ): Promise<string[]> {
 	const uploads: string[] = [];
 	if (_snapshot) expect([..._snapshot].every((key) => store.has(sessionId, key))).toBe(true);
 	await captureNativeMessages(sessionId, messages, state, store, async (pairs) => {
 		uploads.push(...pairs.map((pair) => pair.content));
 		return true;
-	});
+	}, undefined, undefined, branchEntries);
 	return uploads;
 }
 
@@ -99,6 +100,16 @@ describe("agent_end native-message capture", () => {
 			];
 
 			expect(await captureUploads(sessionId, eventMessages, captureState(), snapshot, store)).toEqual(["new input"]);
+			expect(store.receiptOutcome(sessionId, nativeMessageKey({
+				id: "legacy-a",
+				role: "user",
+				content: "old input",
+			}, 1))).toBe("legacy_seed");
+			expect(store.receiptOutcome(sessionId, nativeMessageKey({
+				id: "new-no-time",
+				role: "user",
+				content: "new input",
+			}, 1))).toBe("remote_confirmed");
 		});
 	});
 
@@ -174,26 +185,137 @@ describe("agent_end native-message capture", () => {
 			await expect(captureNativeMessages(sessionId, message, captureState(), store, async () => {
 				throw new Error("fake upload failure");
 			})).rejects.toThrow("fake upload failure");
+			expect(store.receiptOutcome(sessionId, nativeMessageKey({
+				id: "retryable",
+				role: "user",
+				content: "retry me",
+			}, 1))).toBeNull();
 			expect(store.hasReceiptFile(sessionId)).toBe(true);
 			expect(store.pending(sessionId, [nativeMessageKey({ id: "retryable", role: "user", content: "retry me" }, 1)])).toEqual([
 				nativeMessageKey({ id: "retryable", role: "user", content: "retry me" }, 1),
 			]);
 			expect(await captureUploads(sessionId, message, captureState(), snapshot, store)).toEqual(["retry me"]);
+			expect(store.receiptOutcome(sessionId, nativeMessageKey({
+				id: "retryable",
+				role: "user",
+				content: "retry me",
+			}, 1))).toBe("remote_confirmed");
 		});
 	});
 
-	test("branch entry IDs do not replace message identity", async () => {
+	test("machine envelope is withheld while a following human input and quoted template are uploaded once", async () => {
+		await withTempDirectory(async (directory) => {
+			const sessionId = "mixed-orca-envelope";
+			const store = new MessageAckStore(directory);
+			const messages = [
+				nativeUserMessage("machine-dispatch", [
+					"You are working inside Orca, a multi-agent IDE. You are a dispatched worker.",
+					"Your coordinator's terminal handle is: synthetic-terminal-17",
+					"Your task ID is: synthetic-task-17",
+					"Assignment: inspect a synthetic fixture.",
+				].join("\n")),
+				nativeUserMessage("ambiguous-dispatch", [
+					"You are working inside Orca, a multi-agent IDE. You are a dispatched worker.",
+					"Your coordinator's terminal handle is: synthetic-terminal-18",
+					"Discussion about the missing task identity marker.",
+				].join("\n")),
+				nativeUserMessage("human-after-dispatch", "Please remember that I prefer concise summaries."),
+				nativeUserMessage("human-template-quote", "I saw “You are working inside Orca, a multi-agent IDE.” in the template."),
+			];
+			const ambiguousEventKeys: string[] = [];
+			const state = captureState();
+			const captured: Array<{ content: string; key: string; identityKind: string }> = [];
+
+			await captureNativeMessages(sessionId, messages, state, store, async (pairs) => {
+				captured.push(...pairs.map(({ content, key, identityKind }) => ({ content, key, identityKind })));
+				return true;
+			}, undefined, (eventKey) => ambiguousEventKeys.push(eventKey));
+			expect(ambiguousEventKeys).toHaveLength(1);
+
+			expect(captured.map((pair) => pair.content)).toEqual([
+				"Please remember that I prefer concise summaries.",
+				"I saw “You are working inside Orca, a multi-agent IDE.” in the template.",
+			]);
+			expect(captured.every((pair) => pair.identityKind === "native_message_id")).toBe(true);
+			expect(captured[0]?.key).not.toBe(captured[1]?.key);
+			expect(await captureUploads(sessionId, messages, captureState(), undefined, store)).toEqual([]);
+		});
+	});
+
+	test("branch event identity seeds and suppresses the matching id-less native message", async () => {
 		await withTempDirectory(async (directory) => {
 			const sessionId = "message-id-only";
 			const store = new MessageAckStore(directory);
 			const snapshots = new NativeHistorySnapshots();
 			const oldMessage: NativeCaptureInput = { role: "user", content: "restored id-less input", timestamp: 1_790_413_200_000 };
-			const snapshot = snapshots.observe(sessionId, [{
+			const entries: NativeBranchEntry[] = [{
 				type: "message",
 				id: "branch-entry-id",
 				message: oldMessage,
-			}], store);
-			expect(await captureUploads(sessionId, [oldMessage], captureState(), snapshot, store)).toEqual([]);
+			}];
+			const snapshot = snapshots.observe(sessionId, entries, store);
+			expect(await captureUploads(sessionId, [oldMessage], captureState(), snapshot, store, entries)).toEqual([]);
+			expect(store.receiptOutcome(sessionId, [...snapshot!][0]!)).toBe("legacy_seed");
+		});
+	});
+	test("legacy snapshots retain payload-only compatibility keys when wrapper identity differs", async () => {
+		await withTempDirectory(async (directory) => {
+			const sessionId = "wrapper-versus-payload-identity";
+			const store = new MessageAckStore(directory);
+			const snapshots = new NativeHistorySnapshots();
+			const payload: NativeCaptureInput = {
+				role: "user",
+				content: "payload has no identity timestamp",
+			};
+			const entries: NativeBranchEntry[] = [{
+				type: "message",
+				id: "wrapper-event-id",
+				timestamp: "wrapper-only-time",
+				message: payload,
+			}];
+			const snapshot = snapshots.observe(sessionId, entries, store);
+			const payloadKey = nativeMessageKey({
+				id: null,
+				role: "user",
+				content: "payload has no identity timestamp",
+			}, 1);
+
+			expect(snapshot?.has(payloadKey)).toBe(true);
+			expect(await captureUploads(sessionId, [payload], captureState(), snapshot, store)).toEqual([]);
+		});
+	});
+
+	test("branch event ID becomes the primary cloud-correlation key", async () => {
+		await withTempDirectory(async (directory) => {
+			const sessionId = "branch-event-upload";
+			const store = new MessageAckStore(directory);
+			const message: NativeCaptureInput = {
+				role: "user",
+				content: "same words can be distinct native events",
+				timestamp: 1_790_413_200_000,
+			};
+			const entries: NativeBranchEntry[] = [{
+				type: "message",
+				id: "native-branch-event-7",
+				message,
+			}];
+			const uploaded: Array<{ key: string; identityKind: string }> = [];
+
+			await captureNativeMessages(sessionId, [message], captureState(), store, async (pairs) => {
+				uploaded.push(...pairs.map(({ key, identityKind }) => ({ key, identityKind })));
+				return true;
+			}, undefined, undefined, entries);
+
+			expect(uploaded).toEqual([{
+				key: nativeMessageKey({
+					id: "native-branch-event-7",
+					timestamp: 1_790_413_200_000,
+					role: "user",
+					content: "same words can be distinct native events",
+				}, 1),
+				identityKind: "native_branch_entry_id",
+			}]);
+			expect(store.receiptOutcome(sessionId, uploaded[0]!.key)).toBe("remote_confirmed");
 		});
 	});
 
@@ -211,15 +333,18 @@ describe("agent_end native-message capture", () => {
 		});
 	});
 
-	test("an r1 receipt remains acknowledged after upgrade", async () => {
+	test("legacy string receipts remain dedup-only after upgrade", async () => {
 		await withTempDirectory(async (directory) => {
 			const sessionId = "r1-receipt";
-			const store = new MessageAckStore(directory);
 			const message = nativeUserMessage("already-uploaded", "existing input", 1_790_413_200_000);
 			const oldKey = createHash("sha256")
 				.update(JSON.stringify([["already-uploaded", 1_790_413_200_000, "user"], 1]))
 				.digest("hex");
-			store.seedLegacy(sessionId, [oldKey]);
+			const fileKey = createHash("sha256").update(sessionId).digest("hex");
+			writeFileSync(join(directory, `${fileKey}.jsonl`), `${JSON.stringify(oldKey)}\n`, "utf8");
+			const store = new MessageAckStore(directory);
+
+			expect(store.receiptOutcome(sessionId, oldKey)).toBe("legacy_unclassified");
 			expect(await captureUploads(sessionId, [message], captureState(), new Set(), store)).toEqual([]);
 		});
 	});

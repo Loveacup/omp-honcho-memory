@@ -102,6 +102,12 @@ declare module "@oh-my-pi/pi-coding-agent" {
       ctx: ExtensionContext,
     ): Promise<AgentToolResult<TDetails>>;
   };
+  export type ToolInfo = {
+    name: string;
+    label?: string;
+    description?: string;
+    active?: boolean;
+  };
 
   export type ExtensionAPI = {
     readonly logger: unknown;
@@ -193,7 +199,7 @@ declare module "@oh-my-pi/pi-coding-agent" {
       options?: { cwd?: string; env?: Record<string, string> },
     ): Promise<{ stdout: string; stderr: string; exitCode: number }>;
     getActiveTools(): string[];
-    getAllTools(): string[];
+    getAllTools(): ToolInfo[];
     setActiveTools(toolNames: string[]): Promise<void>;
     getCommands(): Array<{ name: string; description?: string }>;
     setModel(model: unknown): Promise<boolean>;

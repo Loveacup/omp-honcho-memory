@@ -1,4 +1,4 @@
-import { userConclusionObserver, userConclusionView, type HonchoHandles, type HonchoMessage } from "./client.js";
+import { userConclusionObserver, type HonchoHandles, type HonchoMessage } from "./client.js";
 
 // --- Async save queue: serializes Honcho uploads so multiple agent_end
 // events do not issue concurrent addMessages calls. Boundaries such as
@@ -356,7 +356,6 @@ export function compileMemoryContext(
 export function formatContinuityContext(
 	handles: HonchoHandles,
 	lastInjectedContext: string | null,
-	recentConclusions: string[],
 ): string | null {
 	const lines: string[] = [];
 
@@ -370,14 +369,6 @@ export function formatContinuityContext(
 		lines.push("");
 		lines.push("Last injected memory:");
 		lines.push(lastInjectedContext);
-	}
-
-	if (recentConclusions.length > 0) {
-		lines.push("");
-		lines.push("Recent durable conclusions:");
-		for (const conclusion of recentConclusions) {
-			lines.push(`- ${conclusion}`);
-		}
 	}
 
 	return lines.join("\n");
@@ -420,18 +411,4 @@ export async function saveToolSummary(
 		handles.aiPeer.message(trimmed, { metadata, createdAt }),
 	]);
 }
-
-export async function saveUserConclusion(
-	handles: HonchoHandles,
-	content: string,
-): Promise<{ saved: boolean; error?: string }> {
-	const trimmed = clampText(content.trim(), 25_000);
-	if (!trimmed) return { saved: false, error: "Empty content." };
-	await userConclusionView(handles).create({
-		content: trimmed,
-		sessionId: handles.session.id,
-	});
-	return { saved: true };
-}
-
 

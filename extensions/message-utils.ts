@@ -109,20 +109,6 @@ export function collectToolSummary(
 	return summaries.join("; ");
 }
 
-const DURABLE_PATTERNS = [
-	/\b(i\s+(?:like|prefer|want|need|hate|dislike|love)|we\s+should\s+(?:always|never)|(?:always|never)\s+(?:use|do|set)|my\s+(?:preferred|favorite)|\bprefer\b|\bpreference\b)/i,
-	/(我(?:喜欢|偏好|想要|需要|讨厌|不喜欢|爱)|我们(?:应该|不应该|总是|永远|绝不|要|不要)|(?:总是|永远|绝不|不要)\s*(?:使用|做|设置)|我的(?:偏好|最爱|首选)|偏好|倾向|习惯)/,
-];
-
-export function extractDurableConclusion(content: string): string | null {
-	const trimmed = content.trim();
-	if (!trimmed) return null;
-	if (!DURABLE_PATTERNS.some((pattern) => pattern.test(trimmed))) {
-		return null;
-	}
-	return trimmed;
-}
-
 export function estimateTokens(text: string): number {
 	return Math.ceil(text.length / 4);
 }

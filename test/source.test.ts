@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { classifyEntry, stripInjectedUserText, type AncestorLookup } from "../core/source.js";
+import { classifyEntry, classifyOrcaEnvelope, stripInjectedUserText, stripOmpUserText, type AncestorLookup } from "../core/source.js";
 import { resolveConfigForHost } from "../extensions/config.js";
 
 function ancestry(rows: Record<number, { ppid: number; args: string }>): AncestorLookup {
@@ -104,6 +104,56 @@ describe("injection stripping", () => {
 
 	test("a message empty after recall removal is discarded", () => {
 		expect(stripInjectedUserText("\n<honcho-memory>old</honcho-memory>\n<memory-context>cache</memory-context>\n")).toBeNull();
+	});
+	test("complete observed Orca continuation envelope is excluded but a following human turn survives", () => {
+		const machine = [
+			"Continue work from the prior Orca session using the context below.",
+			"Original agent: worker-17",
+			"Prior read-only provider context follows.",
+			"Prior transcript: `sessions/worker-17.jsonl`",
+		].join("\n");
+
+		expect(stripOmpUserText(machine)).toBeNull();
+		expect(stripOmpUserText("Please continue from the prior Orca session, but do not use its old context."))
+			.toBe("Please continue from the prior Orca session, but do not use its old context.");
+		expect(stripOmpUserText("I saw this template: “Continue work from the prior Orca session using the context below.”"))
+			.toBe("I saw this template: “Continue work from the prior Orca session using the context below.”");
+	});
+
+	test("complete observed Orca dispatch envelope is excluded but discussion of its opener is retained", () => {
+		const machine = [
+			"You are working inside Orca, a multi-agent IDE. You are a dispatched worker.",
+			"Your coordinator's terminal handle is: synthetic-terminal-17",
+			"Your task ID is: synthetic-task-17",
+			"Assignment: inspect the synthetic fixture.",
+		].join("\n");
+		const humanDiscussion = [
+			"You are working inside Orca, a multi-agent IDE. You are a dispatched worker.",
+			"I am quoting that opener to ask how the dispatched-worker template is classified.",
+		].join("\n");
+
+		expect(classifyOrcaEnvelope(machine)).toBe("machine");
+		expect(stripOmpUserText(machine)).toBeNull();
+		expect(classifyOrcaEnvelope(humanDiscussion)).toBe("ordinary");
+		expect(stripOmpUserText(humanDiscussion)).toBe(humanDiscussion);
+		expect(stripOmpUserText("The dispatched-worker template begins with “You are working inside Orca, a multi-agent IDE.”"))
+			.toBe("The dispatched-worker template begins with “You are working inside Orca, a multi-agent IDE.”");
+	});
+	test("human continuation discussion does not become machine evidence from words inside prose", () => {
+		const discussion = [
+			"Continue work from the prior Orca session using the context below.",
+			"I am discussing Original agent wording and read-only prior transcripts at /tmp/examples.",
+		].join("\n");
+		expect(stripOmpUserText(discussion)).toBe(discussion);
+	});
+	test("the shared hook stripping contract does not acquire OMP-only envelope policy", () => {
+		const envelope = [
+			"You are working inside Orca, a multi-agent IDE. You are a dispatched worker.",
+			"Your coordinator's terminal handle is: synthetic-terminal-17",
+			"Your task ID is: synthetic-task-17",
+		].join("\n");
+		expect(stripInjectedUserText(envelope)).toBe(envelope);
+		expect(stripOmpUserText(envelope)).toBeNull();
 	});
 });
 

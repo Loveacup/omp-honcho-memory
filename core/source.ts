@@ -45,6 +45,40 @@ const LEADING_INJECTION = new RegExp(
 	"i",
 );
 const OWN_RECALL_BLOCK = /<(honcho-memory|memory-context)\b[^>]*>[\s\S]*?<\/\1\s*>/gi;
+const ORCA_CONTINUATION_START = "Continue work from the prior Orca session using the context below.";
+const ORCA_DISPATCH_START = "You are working inside Orca, a multi-agent IDE. You are a dispatched worker.";
+
+export type OrcaEnvelopeClass = "machine" | "ambiguous" | "ordinary";
+
+/**
+ * OMP exposes user-role messages but no trusted per-turn origin in AgentEndEvent.
+ * Only complete observed signatures are machine; partial structural markers are
+ * refused as ambiguous, while a bare opener can remain human template discussion.
+ */
+export function classifyOrcaEnvelope(text: string): OrcaEnvelopeClass {
+	const firstLine = text.split(/\r?\n/, 1)[0];
+	if (firstLine === ORCA_DISPATCH_START) {
+		const hasCoordinatorHandle = /^Your coordinator's terminal handle is:[ \t]*\S.*$/m.test(text);
+		const hasTaskId = /^Your task ID is:[ \t]*\S.*$/m.test(text);
+		if (hasCoordinatorHandle && hasTaskId) return "machine";
+		return hasCoordinatorHandle || hasTaskId ? "ambiguous" : "ordinary";
+	}
+	if (firstLine !== ORCA_CONTINUATION_START) return "ordinary";
+	const hasOriginalAgent = /^Original agent:[ \t]*\S.*$/m.test(text);
+	const hasPriorReadOnlyContext = /^The prior provider session is read-only context\b/m.test(text);
+	const hasTranscriptPath = /^(?:Original working directory|Prior (?:session )?transcript):[ \t]*`?[^\r\n]*(?:\/|\\)/m.test(text);
+	if (hasOriginalAgent && hasPriorReadOnlyContext && hasTranscriptPath) return "machine";
+	return hasOriginalAgent || hasPriorReadOnlyContext || hasTranscriptPath ? "ambiguous" : "ordinary";
+}
+
+/**
+ * Drop known host/self injections and complete observed machine envelopes.
+ * An ambiguous Orca opener is also withheld; callers can report the refusal.
+ */
+export function stripOmpUserText(text: string): string | null {
+	if (classifyOrcaEnvelope(text) !== "ordinary") return null;
+	return stripInjectedUserText(text);
+}
 
 function automationMarker(env: NodeJS.ProcessEnv): boolean {
 	const value = env.HONCHO_AUTOMATION;

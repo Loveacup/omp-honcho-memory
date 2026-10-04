@@ -1,9 +1,10 @@
 import { collectMessagePairs } from "./message-utils.js";
-import { stripInjectedUserText } from "../core/source.js";
+import { classifyOrcaEnvelope, stripOmpUserText } from "../core/source.js";
 import { MessageAckStore, nativeMessageKey, nativeMessageKeyR2 } from "./message-ack.js";
 
 export interface NativeCaptureInput {
 	id?: unknown;
+	nativeEventId?: unknown;
 	timestamp?: unknown;
 	role: string;
 	content?: unknown;
@@ -13,6 +14,7 @@ export interface NativeCapturePair {
 	role: "user" | "assistant";
 	content: string;
 	key: string;
+	identityKind: "native_branch_entry_id" | "native_message_id" | "timestamp_content_fallback";
 }
 
 export interface NativeCaptureState {
@@ -30,45 +32,97 @@ interface Candidate {
 	pair: NativeCapturePair;
 	receiptKeys: readonly string[];
 }
-function candidatesFromMessages(messages: readonly NativeCaptureInput[]): Candidate[] {
+function branchEventIdMap(entries: readonly NativeBranchEntry[]): Map<string, string | null> {
+	const idsByFingerprint = new Map<string, string | null>();
+	for (const entry of entries) {
+		if (entry.type !== "message" || typeof entry.id !== "string" || !entry.message) continue;
+		const pair = collectMessagePairs([entry.message])[0];
+		if (!pair) continue;
+		const timestamp = typeof entry.message.timestamp === "string" || typeof entry.message.timestamp === "number"
+			? entry.message.timestamp
+			: null;
+		const fingerprint = nativeMessageKey({ id: null, timestamp, role: pair.role, content: pair.content }, 1);
+		idsByFingerprint.set(fingerprint, idsByFingerprint.has(fingerprint) ? null : entry.id);
+	}
+	return idsByFingerprint;
+}
 
-	// Count duplicates in each ordered full-history input; snapshots and agent_end both see
-	// session history. Native millisecond timestamps keep same-ID r1 occurrence groups stable.
+function candidatesFromMessages(
+	messages: readonly NativeCaptureInput[],
+	onAmbiguousSource?: (eventKey: string) => void,
+	branchEntries?: readonly NativeBranchEntry[],
+): Candidate[] {
+	// Preserve deployed r1/r2 identities as compatibility receipts while using a
+	// matched native branch-entry ID as the current event identity when available.
+	const primaryOccurrences = new Map<string, number>();
 	const r1Occurrences = new Map<string, number>();
 	const r2Occurrences = new Map<string, number>();
+	const branchIds = branchEntries ? branchEventIdMap(branchEntries) : undefined;
 	const candidates: Candidate[] = [];
 	for (const native of messages) {
 		const pair = collectMessagePairs([native])[0];
 		if (!pair) continue;
-		const content = pair.role === "user" ? stripInjectedUserText(pair.content) : pair.content;
-		if (!content) continue;
-		const normalized = {
+		const rawContent = pair.content;
+		const timestamp = typeof native.timestamp === "string" || typeof native.timestamp === "number" ? native.timestamp : null;
+		const legacyIdentity = {
 			id: typeof native.id === "string" ? native.id : null,
-			timestamp: typeof native.timestamp === "string" || typeof native.timestamp === "number" ? native.timestamp : null,
+			timestamp,
 			role: pair.role,
-			content,
+			content: rawContent,
 		};
-		const r1Fingerprint = nativeMessageKey(normalized, 0);
+		const matchFingerprint = nativeMessageKey({ ...legacyIdentity, id: null }, 1);
+		const branchId = typeof native.nativeEventId === "string"
+			? native.nativeEventId
+			: branchIds?.get(matchFingerprint) ?? null;
+		const nativeEventId = branchId ?? legacyIdentity.id;
+		if (pair.role === "user" && classifyOrcaEnvelope(rawContent) === "ambiguous") {
+			onAmbiguousSource?.(nativeMessageKey({ ...legacyIdentity, id: nativeEventId }, 1));
+		}
+		const content = pair.role === "user" ? stripOmpUserText(rawContent) : rawContent;
+		if (!content) continue;
+
+		const legacyNormalized = { ...legacyIdentity, content };
+		const r1Fingerprint = nativeMessageKey(legacyNormalized, 0);
 		const r1Occurrence = (r1Occurrences.get(r1Fingerprint) ?? 0) + 1;
 		r1Occurrences.set(r1Fingerprint, r1Occurrence);
-		const r2Fingerprint = nativeMessageKeyR2(normalized, 0);
+		const r2Fingerprint = nativeMessageKeyR2(legacyNormalized, 0);
 		const r2Occurrence = (r2Occurrences.get(r2Fingerprint) ?? 0) + 1;
 		r2Occurrences.set(r2Fingerprint, r2Occurrence);
-		const key = nativeMessageKey(normalized, r1Occurrence);
+
+		const normalized = { ...legacyNormalized, id: nativeEventId };
+		const primaryFingerprint = nativeMessageKey(normalized, 0);
+		const primaryOccurrence = (primaryOccurrences.get(primaryFingerprint) ?? 0) + 1;
+		primaryOccurrences.set(primaryFingerprint, primaryOccurrence);
+		const key = nativeMessageKey(normalized, primaryOccurrence);
 		candidates.push({
-			pair: { ...pair, content, key },
-			receiptKeys: [key, nativeMessageKeyR2(normalized, r2Occurrence)],
+			pair: {
+				...pair,
+				content,
+				key,
+				identityKind: branchId
+					? "native_branch_entry_id"
+					: legacyIdentity.id ? "native_message_id" : "timestamp_content_fallback",
+			},
+			receiptKeys: [key, nativeMessageKey(legacyNormalized, r1Occurrence), nativeMessageKeyR2(legacyNormalized, r2Occurrence)],
 		});
 	}
 	return candidates;
 }
 
-/** Build migration identities from message payloads only, matching agent_end normalization. */
+/** Build migration identities and compatibility receipts from native branch entries. */
 export function snapshotNativeHistory(entries: readonly NativeBranchEntry[]): Set<string> {
 	const messages = entries
 		.filter((entry) => entry.type === "message" && entry.message)
-		.map((entry) => entry.message!);
-	return new Set(candidatesFromMessages(messages).map((candidate) => candidate.pair.key));
+		.map((entry) => ({
+			...entry.message!,
+			nativeEventId: typeof entry.id === "string" ? entry.id : entry.message!.nativeEventId,
+		}));
+	const keys = new Set<string>();
+	for (const candidate of candidatesFromMessages(messages)) {
+		keys.add(candidate.pair.key);
+		for (const receiptKey of candidate.receiptKeys) keys.add(receiptKey);
+	}
+	return keys;
 }
 
 /**
@@ -128,8 +182,10 @@ export async function captureNativeMessages(
 	acknowledgements: MessageAckStore,
 	upload: (pairs: NativeCapturePair[]) => Promise<boolean>,
 	onAcknowledgementFailure?: () => void,
+	onAmbiguousSource?: (eventKey: string) => void,
+	branchEntries?: readonly NativeBranchEntry[],
 ): Promise<NativeCapturePair[]> {
-	const candidates = candidatesFromMessages(messages);
+	const candidates = candidatesFromMessages(messages, onAmbiguousSource, branchEntries);
 	const acknowledged = acknowledgements.load(sessionId);
 	const pairs = candidates
 		.filter((candidate) =>

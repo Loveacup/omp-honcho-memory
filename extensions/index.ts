@@ -7,6 +7,7 @@ import type {
 import { appendFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { createHonchoHandles, type HonchoHandles, type HonchoMessage, type SessionKey } from "./client.js";
+import { applyActiveTools, createIsolatedRun } from "./isolated-run.js";
 import { resolveConfig, isConfigured, getSessionOverride } from "./config.js";
 import {
 	compileMemoryContext,
@@ -14,7 +15,6 @@ import {
 	hydrateMemoryContext,
 	queueMessageBatch,
 	refreshPromptContext,
-	saveUserConclusion,
 	formatContinuityContext,
 	parseObservationLines,
 	formatPeerCardCompact,
@@ -22,11 +22,7 @@ import {
 	type ContextCache,
 	type MemoryContextBlock,
 } from "./memory.js";
-import {
-	collectToolSummary,
-	extractDurableConclusion,
-	maybeTruncateContent,
-} from "./message-utils.js";
+import { collectToolSummary, maybeTruncateContent } from "./message-utils.js";
 import { buildSessionKey } from "./session-key.js";
 import { registerTools } from "./tools.js";
 import { registerCommands } from "./commands.js";
@@ -34,7 +30,7 @@ import { searchWorkspaceMessages, type RawSearchResult } from "./raw-search.js";
 import { formatRawRecall, RAW_RECALL_BUDGET_EXCEEDED_CODE } from "./raw-recall.js";
 import { classifyEntry, type EntryClass } from "../core/source.js";
 import { MessageAckStore } from "./message-ack.js";
-import { captureNativeMessages, NativeHistorySnapshots, observeNativeHistoryAtLifecycle } from "./message-capture.js";
+import { captureNativeMessages, NativeHistorySnapshots, observeNativeHistoryAtLifecycle, type NativeBranchEntry } from "./message-capture.js";
 
 interface SessionState {
 	handles: HonchoHandles | null;
@@ -44,7 +40,6 @@ interface SessionState {
 	lastPromptContextQuery: string | null;
 	messageCount: number;
 	lastUserTurnCount: number;
-	recentConclusions: string[];
 	/** Set to true after session_start finishes loading memory */
 	memoryReady: boolean;
 	/** Acknowledged native messages, hydrated from durable per-session receipts. */
@@ -62,7 +57,6 @@ function createSessionState(): SessionState {
 		lastPromptContextQuery: null,
 		messageCount: 0,
 		lastUserTurnCount: 0,
-		recentConclusions: [],
 		memoryReady: false,
 		savedMessageKeys: new Set(),
 		agentEndSave: null,
@@ -72,9 +66,17 @@ function createSessionState(): SessionState {
 const CONTEXT_FETCH_TIMEOUT_MS = 4000;
 const HYDRATE_TIMEOUT_MS = 8000;
 
-const LOG_FILE = "/tmp/honcho-plugin.log";
-function log(msg: string): void {
-	try { appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${msg}\n`); } catch {}
+function legacyLog(msg: string): void {
+	try { appendFileSync("/tmp/honcho-plugin.log", `[${new Date().toISOString()}] ${msg}\n`); } catch {}
+}
+function logAnchor(value: string): string {
+	return createHash("sha256").update(value).digest("hex").slice(0, 16);
+}
+function errorCategory(error: unknown): string {
+	if (error instanceof TypeError) return "TypeError";
+	if (error instanceof RangeError) return "RangeError";
+	if (error instanceof Error) return "Error";
+	return "NonError";
 }
 
 // ---------------------------------------------------------------------------
@@ -153,7 +155,7 @@ function boundContextRegion(compiled: string | null, toolHint: string): string[]
  * budget or throws — we catch and fall back), and never reports a failed/aborted
  * transport as a confirmed empty current state.
  */
-function buildRawAppend(rawResult: RawSearchResult | null): string | null {
+function buildRawAppend(rawResult: RawSearchResult | null, log: (message: string) => void): string | null {
 	if (!rawResult) return RAW_UNAVAILABLE_NOTICE; // launch/catch produced no result
 	// Only a completed retrieval (ok/empty) is rendered as evidence; a failed or
 	// aborted transport is surfaced as "unavailable", never as an empty result.
@@ -180,16 +182,31 @@ function classifyOmpEntry(ctx: ExtensionContext): EntryClass {
 	});
 }
 
-function sourceMetadata(entryClass: EntryClass, sessionId: string): Record<string, string> {
+function sourceMetadata(
+	entryClass: EntryClass,
+	sessionId: string,
+	eventKey?: string,
+	identityKind?: "native_branch_entry_id" | "native_message_id" | "timestamp_content_fallback",
+): Record<string, string> {
 	return {
 		host: "omp",
 		entry_class: entryClass,
 		host_session_id: sessionId,
+		...(eventKey && identityKind ? {
+			native_event_key: eventKey,
+			native_identity_kind: identityKind,
+		} : {}),
 	};
 }
 
 
 export default function honchoMemoryExtension(pi: ExtensionAPI): void {
+	const isolatedRun = createIsolatedRun();
+	const log = isolatedRun?.log ?? legacyLog;
+	let toolPolicyApplied = false;
+	function trackBackground(operation: Promise<unknown>): void {
+		if (isolatedRun) void isolatedRun.track(operation);
+	}
 	const sessions = new Map<SessionKey, SessionState>();
 	const bootstrapLocks = new Map<SessionKey, Promise<HonchoHandles | null>>();
 	const uiStates = new Map<string, { connectedAnnounced: boolean; offline: boolean }>();
@@ -257,7 +274,7 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 		const t0 = Date.now();
 		const promise = (async (): Promise<HonchoHandles | null> => {
 			try {
-				const handles = await createHonchoHandles({ config, sessionKey });
+				const handles = await createHonchoHandles({ config, sessionKey, isolatedRun });
 				log(`bootstrap: createHonchoHandles done in ${Date.now() - t0}ms`);
 				const state = getState(sessionKey);
 				state.handles = handles;
@@ -298,8 +315,8 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 			getBranch,
 			nativeHistorySnapshots,
 			messageAcks,
-			(error) => log(`legacy snapshot: getBranch failed for ${sessionId}: ${String(error)}`),
-			() => log(`legacy snapshot: receipt initialization failed for session ${sessionId}`),
+			(error) => log(`capture phase=branch_read session_anchor=${logAnchor(sessionId)} error_category=${errorCategory(error)}`),
+			() => log(`capture phase=legacy_seed session_anchor=${logAnchor(sessionId)} outcome=failed`),
 		);
 	}
 
@@ -366,6 +383,10 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 	}
 
 	pi.on("session_start", async (_event, ctx) => {
+		if (isolatedRun && !toolPolicyApplied) {
+			await applyActiveTools(pi, isolatedRun.activeTools);
+			toolPolicyApplied = true;
+		}
 		const t0 = Date.now();
 		const sessionId = getNativeSessionId(ctx);
 		if (!sessionId) return;
@@ -410,7 +431,7 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 					},
 				}),
 			);
-			handles.session.addMessages(messages).catch((err) => log(`session_start: git observations failed: ${String(err)}`));
+			trackBackground(handles.session.addMessages(messages).catch((err) => log(`session_start: git observations failed: ${String(err)}`)));
 		}
 
 		const t1 = Date.now();
@@ -440,23 +461,23 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 		const dialecticLevel = handles.config.reasoningLevel;
 		try {
 			if (handles.config.observationMode === "unified") {
-				handles.userPeer.chat(
+				trackBackground(handles.userPeer.chat(
 					`Summarize what you know about ${handles.config.peerName}. Focus on preferences, current projects, and working style.${branchContext}${featureHint}`,
 					{ session: handles.session, reasoningLevel: dialecticLevel },
-				).catch((err) => log(`session_start: dialectic user failed: ${String(err)}`));
-				handles.userPeer.chat(
+				).catch((err) => log(`session_start: dialectic user failed: ${String(err)}`)));
+				trackBackground(handles.userPeer.chat(
 					`What has ${handles.config.peerName} been working on recently?${branchContext}${featureHint} Summarize recent activities relevant to the current work.`,
 					{ session: handles.session, reasoningLevel: dialecticLevel },
-				).catch((err) => log(`session_start: dialectic recent failed: ${String(err)}`));
+				).catch((err) => log(`session_start: dialectic recent failed: ${String(err)}`)));
 			} else {
-				handles.aiPeer.chat(
+				trackBackground(handles.aiPeer.chat(
 					`Summarize what you know about ${handles.config.peerName}. Focus on preferences, current projects, and working style.${branchContext}${featureHint}`,
 					{ target: handles.userPeer, session: handles.session, reasoningLevel: dialecticLevel },
-				).catch((err) => log(`session_start: dialectic user failed: ${String(err)}`));
-				handles.aiPeer.chat(
+				).catch((err) => log(`session_start: dialectic user failed: ${String(err)}`)));
+				trackBackground(handles.aiPeer.chat(
 					`What has ${handles.config.peerName} been working on recently?${branchContext}${featureHint} Summarize recent activities relevant to the current work.`,
 					{ target: handles.userPeer, session: handles.session, reasoningLevel: dialecticLevel },
-				).catch((err) => log(`session_start: dialectic recent failed: ${String(err)}`));
+				).catch((err) => log(`session_start: dialectic recent failed: ${String(err)}`)));
 			}
 		} catch {
 			// Non-fatal: dialectic warmup is best-effort.
@@ -464,6 +485,7 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
+		if (isolatedRun) await applyActiveTools(pi, isolatedRun.activeTools);
 		const sessionId = getNativeSessionId(ctx);
 		if (sessionId && classifyOmpEntry(ctx) === "user_interactive") observeNativeHistory(sessionId, ctx);
 		// Drain any queued uploads from the previous session before switching.
@@ -620,7 +642,7 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 
 		// S2b: temporarily append the parallel raw retrieval into its own reserved
 		// region. It is surfaced ONLY on the returned prompt for this turn — never
-		// written to lastMemoryContext / cache / recentConclusions, never uploaded,
+		// written to lastMemoryContext / cache, never uploaded,
 		// never sent as a message. A raw failure degrades to a fixed bounded note
 		// and can never make the hook throw.
 		let rawAppend: string | null = null;
@@ -629,7 +651,7 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 				// The promise never rejects (caught at launch); a null result means a
 				// hard failure and buildRawAppend degrades it to the fixed note.
 				const rawResult = await rawResultPromise;
-				rawAppend = buildRawAppend(rawResult);
+				rawAppend = buildRawAppend(rawResult, log);
 			} catch (err) {
 				log(`before_agent_start: raw recall unexpected error: ${String(err)}`);
 				rawAppend = RAW_UNAVAILABLE_NOTICE;
@@ -658,14 +680,23 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 		const state = getState(handles.sessionId);
 
 		while (state.agentEndSave) await state.agentEndSave;
+		let branchEntries: readonly NativeBranchEntry[] | undefined;
+		try {
+			branchEntries = ctx.sessionManager.getBranch();
+		} catch (error) {
+			log(`capture phase=branch_read session_anchor=${logAnchor(hostSessionId)} error_category=${errorCategory(error)}`);
+		}
 		let newUserTurns = 0;
+		let attemptedEventKeys: string[] = [];
 		const save = captureNativeMessages(
 			hostSessionId,
 			event.messages ?? [],
 			{ savedMessageKeys: state.savedMessageKeys },
 			messageAcks,
 			async (pairs) => {
-				log(`agent_end: begin, ${pairs.length} pairs`);
+				attemptedEventKeys = pairs.map((pair) => pair.key);
+				const eventKeys = attemptedEventKeys.join(",");
+				log(`capture phase=remote_write outcome=started session_anchor=${logAnchor(hostSessionId)} event_keys=${eventKeys}`);
 				newUserTurns = pairs.filter((pair) => pair.role === "user").length;
 				const batch: HonchoMessage[] = [];
 				const userUploadConfig = { maxTokens: handles.config.messageUpload.maxUserTokens };
@@ -673,23 +704,12 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 					maxTokens: handles.config.messageUpload.maxAssistantTokens,
 					summarize: handles.config.messageUpload.summarizeAssistant,
 				};
-				const metadata = sourceMetadata(entryClass, hostSessionId);
 
 				for (const message of pairs) {
+					const metadata = sourceMetadata(entryClass, hostSessionId, message.key, message.identityKind);
 					if (message.role === "user") {
 						const content = maybeTruncateContent(message.content, userUploadConfig);
 						batch.push(handles.userPeer.message(content, { metadata }));
-						const conclusion = extractDurableConclusion(content);
-						if (conclusion) {
-							saveUserConclusion(handles, conclusion)
-								.then((result) => {
-									if (result.saved) {
-										state.recentConclusions.unshift(conclusion);
-										if (state.recentConclusions.length > 10) state.recentConclusions.length = 10;
-									}
-								})
-								.catch(() => {});
-						}
 					} else {
 						const content = maybeTruncateContent(message.content, assistantUploadConfig);
 						batch.push(handles.aiPeer.message(content, { metadata }));
@@ -701,11 +721,13 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 					setStatus(ctx, "connected");
 					return false;
 				}
-				ctx.ui.notify("↑ 正在保存本轮记忆 · Saving turn memory", "info");
 				await queueMessageBatch(handles, batch);
+				log(`capture phase=remote_write outcome=acknowledged session_anchor=${logAnchor(hostSessionId)} event_keys=${attemptedEventKeys.join(",")}`);
 				return true;
 			},
-			() => log(`agent_end: durable acknowledgement write failed for session ${hostSessionId}`),
+			() => log(`capture phase=local_receipt_append outcome=failed session_anchor=${logAnchor(hostSessionId)} event_keys=${attemptedEventKeys.join(",")}`),
+			(eventKey) => log(`capture phase=source_classification outcome=ambiguous session_anchor=${logAnchor(hostSessionId)} event_key=${eventKey}`),
+			branchEntries,
 		).then(
 			(pairs) => {
 				if (pairs.length === 0) {
@@ -713,12 +735,12 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 					return;
 				}
 				state.lastUserTurnCount += newUserTurns;
-				log(`agent_end: batch saved in ${Date.now() - t0}ms`);
+				log(`capture phase=remote_write outcome=confirmed session_anchor=${logAnchor(hostSessionId)} event_keys=${pairs.map((pair) => pair.key).join(",")} duration_ms=${Date.now() - t0}`);
 				setStatus(ctx, "connected");
 				ctx.ui.notify("✓ 本轮记忆已保存 · Turn memory saved", "success");
 			},
 			(err: unknown) => {
-				log(`agent_end: batch failed: ${String(err)}`);
+				log(`capture phase=remote_write outcome=failed session_anchor=${logAnchor(hostSessionId)} event_keys=${attemptedEventKeys.join(",")} error_category=${errorCategory(err)}`);
 				setStatus(ctx, "offline");
 			},
 		);
@@ -748,7 +770,7 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 		}));
 		state.lastMemoryBlock = memoryBlock;
 		const compiled = compileMemoryContext(memoryBlock, null);
-		const continuity = formatContinuityContext(handles, state.lastMemoryContext, state.recentConclusions);
+		const continuity = formatContinuityContext(handles, state.lastMemoryContext);
 
 		// Memory anchor — injected before compaction to ensure Honcho conclusions
 		// survive summarization (Claude PreCompact pattern).
@@ -773,32 +795,48 @@ export default function honchoMemoryExtension(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", async (_event, ctx) => {
 		const entryClass = classifyOmpEntry(ctx);
 		const nativeSessionId = getNativeSessionId(ctx);
-		// Drain queued uploads before the session goes away. oh-my-pi caps this
-		// handler at 2s, so the flush is awaited but bounded by the host timeout.
-		await flushPending().catch(() => {});
-		setStatus(ctx, "off");
-		const handles = entryClass === "user_interactive" ? await getHandlesFromCtx(ctx).catch(() => null) : null;
-		if (handles && nativeSessionId) {
-			// Best-effort session-end marker; do not await because oh-my-pi
-			// imposes a 2s handler timeout for this event.
-			const marker = handles.aiPeer.message(`[Session ended]`, {
-				metadata: {
-					...sourceMetadata(entryClass, nativeSessionId),
-					type: "session_end_marker",
-				},
-			});
-			handles.session
-				.addMessages([marker])
-				.then(
-					() => log(`session_shutdown: end marker uploaded`),
-					(err: unknown) => log(`session_shutdown: end marker failed: ${String(err)}`),
-				);
+		try {
+			// Drain queued uploads before the session goes away. oh-my-pi caps this
+			// handler at 2s, so the flush is awaited but bounded by the host timeout.
+			await flushPending().catch(() => {});
+
+			setStatus(ctx, "off");
+			const handles = entryClass === "user_interactive" ? await getHandlesFromCtx(ctx).catch(() => null) : null;
+			if (handles && nativeSessionId) {
+				// In normal mode, preserve best-effort fire-and-forget behavior under
+				// the host's shutdown limit; isolated mode awaits it before closing its log.
+				const marker = handles.aiPeer.message(`[Session ended]`, {
+					metadata: {
+						...sourceMetadata(entryClass, nativeSessionId),
+						type: "session_end_marker",
+					},
+				});
+				const markerWrite = handles.session.addMessages([marker]);
+				if (isolatedRun) {
+					try {
+						await markerWrite;
+						log("session_shutdown: end marker uploaded");
+					} catch (err) {
+						log(`session_shutdown: end marker failed: ${String(err)}`);
+					}
+				} else {
+					markerWrite.then(
+						() => log(`session_shutdown: end marker uploaded`),
+						(err: unknown) => log(`session_shutdown: end marker failed: ${String(err)}`),
+					);
+				}
+			}
+		} finally {
+			try {
+				await isolatedRun?.close();
+			} finally {
+				if (nativeSessionId) {
+					const sessionKey = deriveSessionKey(ctx.cwd, nativeSessionId);
+					sessions.delete(sessionKey);
+					nativeHistorySnapshots.delete(nativeSessionId);
+				}
+			}
 		}
-		const sessionId = nativeSessionId;
-		if (!sessionId) return;
-		const sessionKey = deriveSessionKey(ctx.cwd, sessionId);
-		sessions.delete(sessionKey);
-		nativeHistorySnapshots.delete(sessionId);
 	});
 
 	registerTools(pi, { getHandles: getHandlesFromCtx });

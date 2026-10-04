@@ -240,7 +240,6 @@ mock.module("__MEMORY_IMPORT__", () => ({
   },
   flushPending: async () => {},
   queueMessageBatch: async (_handles, batch) => { globalThis.__queued.push(batch); return {}; },
-  saveUserConclusion: async () => ({ saved: false }),
   formatContinuityContext: () => "continuity-line",
   parseObservationLines: (raw) => (typeof raw === "string" && raw ? raw.split("\n") : []),
   formatPeerCardCompact: () => "",
@@ -700,8 +699,6 @@ if (typeof agentEnd === "function") {
   try { await agentEnd(endEvent, ctx); } catch { threw = true; }
   ok("c14 agent_end did not throw", threw === false);
   ok("c14 agent_end issued NO raw workspace POST", guardCalls === before, "delta=" + (guardCalls - before));
-  ok("c14 normal message capture still enabled (batch queued)", globalThis.__queued.length >= 1,
-     "queued=" + globalThis.__queued.length);
   const uploaded = globalThis.__queued.flat().map((m) => (m && m.content) || "").join("\n");
   ok("c14 raw recall document NOT written back to memory",
      uploaded.indexOf("历史检索附注") === -1 && uploaded.indexOf('"formatStatus"') === -1
@@ -843,7 +840,7 @@ mock.module("__MEMORY_IMPORT__", () => ({
   compileMemoryContext: () => globalThis.__mem.compiled,
   hydrateMemoryContext: async () => globalThis.__mem.hydrate,
   refreshPromptContext: async () => ({ text: "PC" }),
-  flushPending: async () => {}, queueMessageBatch: async () => ({}), saveUserConclusion: async () => ({ saved: false }),
+  flushPending: async () => {}, queueMessageBatch: async () => ({}),
   formatContinuityContext: () => "", parseObservationLines: (r) => (r ? String(r).split("\n") : []),
   formatPeerCardCompact: () => "" }));
 const mod = await import("__INDEX_IMPORT__");
@@ -920,7 +917,7 @@ mock.module("__MEMORY_IMPORT__", () => ({
   compileMemoryContext: () => globalThis.__mem.compiled,
   hydrateMemoryContext: async () => globalThis.__mem.hydrate,
   refreshPromptContext: async () => ({ text: "PC" }),
-  flushPending: async () => {}, queueMessageBatch: async () => ({}), saveUserConclusion: async () => ({ saved: false }),
+  flushPending: async () => {}, queueMessageBatch: async () => ({}),
   formatContinuityContext: () => "", parseObservationLines: (r) => (r ? String(r).split("\n") : []),
   formatPeerCardCompact: () => "" }));
 let rawCalls = 0;
@@ -1004,7 +1001,7 @@ mock.module("__CLIENT_IMPORT__", () => ({
   userPeerName: config.peerName, aiPeerName: config.aiPeer, userPeer: fp(config.peerName), aiPeer: fp(config.aiPeer),
   session: { id: "s", addMessages: async () => ({}), addPeers: async () => ({}), summaries: async () => ({}),
              context: async () => ({}), search: async () => [] }, config }) }));
-const observed = { queued: [], compiler: [], continuity: [], conclusions: [], flushes: 0 };
+const observed = { queued: [], compiler: [], continuity: [], flushes: 0 };
 mock.module("__MEMORY_IMPORT__", () => ({
   compileMemoryContext: (...args) => {
     observed.compiler.push(JSON.stringify(args));
@@ -1014,7 +1011,6 @@ mock.module("__MEMORY_IMPORT__", () => ({
   refreshPromptContext: async () => ({ text: "PC" }),
   flushPending: async () => { observed.flushes++; },
   queueMessageBatch: async (_handles, batch) => { observed.queued.push(JSON.stringify(batch)); return {}; },
-  saveUserConclusion: async (_handles, conclusion) => { observed.conclusions.push(JSON.stringify(conclusion)); return { saved: false }; },
   formatContinuityContext: (_handles, ...args) => { observed.continuity.push(JSON.stringify(args)); return ""; }, parseObservationLines: (r) => (r ? String(r).split("\n") : []),
   formatPeerCardCompact: () => "" }));
 // raw-search.js is deliberately NOT mocked — the REAL transport (3500ms deadline
@@ -1135,7 +1131,7 @@ ok("abortlate normal user and assistant capture retained",
    observed.queued.some((s) => s.includes("NORMAL-ABORTLATE-USER") && s.includes("NORMAL-ABORTLATE-ASSISTANT")));
 ok("abortlate compaction compiler and continuity observed with flush",
    observed.compiler.length > compilerBefore && observed.continuity.length > continuityBefore && observed.flushes > 0);
-ok("abortlate raw poison never persisted through capture", !JSON.stringify([observed.queued, observed.conclusions]).includes(POISON));
+ok("abortlate raw poison never persisted through capture", !JSON.stringify(observed.queued).includes(POISON));
 ok("abortlate raw poison never entered compaction state", !JSON.stringify([observed.compiler, observed.continuity]).includes(POISON));
 ok("abortlate lifecycle issued NO raw workspace POST", guardCalls === callsBeforeLifecycle);
 const postCompact = await beforeStart({ type: "before_agent_start", prompt: "ok", images: [], systemPrompt: ["BASE"] }, ctx);
@@ -1175,6 +1171,13 @@ def run_harness(name: str, source: str, workdir: Path, bun: str) -> tuple[int, s
     # endpoint can influence a harness even via a future/unknown env var.
     for key in [k for k in env if k.startswith("HONCHO_")]:
         env.pop(key, None)
+    # Each harness owns its durable capture receipts; mutation runs must not
+    # reuse normal-run acknowledgements or write into the operator's HOME.
+    home = workdir / f"home-{name}"
+    home.mkdir()
+    env["HOME"] = str(home)
+    env["HERMES_HOME"] = str(home / ".hermes")
+    env["PI_CODING_AGENT_DIR"] = str(home / ".omp" / "agent")
     proc = subprocess.run(
         [bun, str(path)], cwd=str(REPO), env=env,
         capture_output=True, text=True, timeout=180,

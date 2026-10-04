@@ -118,6 +118,15 @@ flowchart LR
 
 所有写入消息带 `host`、`entry_class`、`host_session_id` 元数据，任一召回条目都可追到客户端、会话与时间。共享核心位于 `core/source.ts`（入口分类与注入剥离）和 `extensions/config.ts`（按宿主解析 `~/.honcho/config.json`）。
 
+### OMP 来源与逐事件收据边界
+
+- 当前 `agent_end` 没有可区分机器与真人的可信逐回合来源字段；实测二者的 `attribution` 都是 `user`。OMP 捕获和结论工具使用专属格式门，Claude Code/Codex 的共享注入剥离合同不变。dispatch 要求精确固定首行及两条锚定非空行 `Your coordinator's terminal handle is:`、`Your task ID is:`；continuation 要求精确固定首行、锚定 `Original agent:`、`The prior provider session is read-only context`，以及 `Original working directory:` 或 `Prior [session] transcript:` 路径行。完整签名判为机器，部分结构拒绝并记为 `ambiguous`。普通提及和解释性正文不按关键词丢弃；相同、未加引用边界的完整 envelope 无法与机器内容区分，格式匹配不是不可伪造的来源证明。
+- OMP 每条写入消息增加 `native_event_key`（SHA-256 原生身份指纹）和 `native_identity_kind`。可用时，`agent_end` 消息按原始 role、timestamp 与正文精确匹配当前 branch entry，并以唯一的 branch-entry ID 作为事件身份；无法唯一匹配时依次退回 `message.id`、timestamp/content 指纹。迁移快照和上传共用该身份规则。无 branch id 的 fallback 识别能力较弱；并保留部署中的 r1/r2 message-key 作为兼容去重收据。
+- 收据 JSONL 新记录使用 `legacy_seed` 或 `remote_confirmed`。只有 `queueMessageBatch` 成功后才尝试写 `remote_confirmed`；首次历史快照写 `legacy_seed`，只用于延续旧去重，不代表远端上传。升级前的裸字符串收据仍阻止重传，但统一标为 `legacy_unclassified`，不能追认其上传成功。
+- 新增 OMP capture 日志关联 `branch_read`、`legacy_seed`、`source_classification`、`remote_write`、`local_receipt_append` 阶段；session anchor 与 event key 使用 SHA-256 指纹，异常只记类别。这不是其他既有读取日志或 Claude Code/Codex hook 的完整审计声明。隔离的真实 SDK/API smoke 已读回新增事件 metadata、区分历史种子和上传确认，并保留了两条内容相同但事件不同的输入；完整 OMP 原生 TUI 候选消费仍未验收。
+- 插件没有宿主支持的 self-reported loaded-byte fingerprint。安装目录或构建文件 hash 单独不足以证明常驻进程内代码身份；当前源码不向云端声明运行时修订号。构建与隔离 API 验证不等于已部署，生产加载身份仍需独立动作门和实际运行证据。
+- 已知崩溃窗口：远端接受 batch 后、本地 append 前中断，恢复时仍可能重传。隔离 smoke 使用真实远端确认、实际本地 append 拒绝和全新易失状态，观察到同一事件的两条云端记录；这不是 OS 崩溃实测，也不存在已证明的服务端幂等保证，因此不承诺 exactly-once。
+
 ---
 
 <a id="user-guide"></a>
@@ -406,7 +415,7 @@ rollback: 已验证的回滚命令或步骤
 - 首次升级到该机制时，会话里已有的历史按 session_start / session_switch 时的分支快照视为已上传；升级前就上传失败的旧消息不会补传。
 - 上传队列仅存在于当前进程，不是崩溃后可恢复的持久 journal。
 - OMP 会限制 shutdown hook 的执行时间，正常轮次持久化不能只依赖关闭事件。
-- 自动长期结论提取保持克制，但仍可能把临时偏好误判为稳定偏好。
+- OMP 扩展不再按关键词从用户消息自动提取长期结论；本插件只通过显式写入工具（OMP `honcho_add_conclusion`／`honcho_remember`、Claude MCP 新增结论）写结论。工具存在不代表系统能识别用户对每条结论的明确批准；Honcho 服务端仍可能从已上传消息自行推理派生结论，本插件不控制其质量。
 - Peer、Session 和 scope 不等于强制访问控制。
 
 ## 🔐 安全边界
@@ -415,6 +424,42 @@ rollback: 已验证的回滚命令或步骤
 - 首次验证只使用合成、非敏感数据。
 - 每次 OMP 升级后重新检查扩展 API 和生命周期行为。
 - 公开 Issue 中只放脱敏复现，不上传真实会话或配置。
+
+
+### OMP 隔离运行（可选）
+
+零模型本地验证可在启动 OMP 前同时设置以下两个环境变量；两者缺一即拒绝初始化。目录必须已存在、为有效用户拥有的真实目录，并且不允许 group/world 可写：
+
+```sh
+export HONCHO_ISOLATED_RUN_DIR="/absolute/path/to/private-run-directory"
+export HONCHO_ISOLATED_ACTIVE_TOOLS='["read","bash"]'
+```
+
+这两个标志本身不切换 Honcho base URL、不清除凭据，也不保证不会访问云端；执行前必须独立确认客户端指向本地 HTTP fixture 且进程处于获准的隔离环境。
+
+`HONCHO_ISOLATED_ACTIVE_TOOLS` 必须是无重复、非空工具名组成的 JSON 字符串数组；空数组表示不启用任何工具。扩展会在 `session_start` 和 `session_switch` 时通过 OMP 公共 API 检查名称、设置并逐项核对激活集合。`getAllTools()` 的名称清单按 OMP v18.4.6 返回工具对象读取。策略控制的是工具暴露，不绕过工具自身 approval，也不证明工具运行安全或形成模型/请求硬上限。未设置两个变量时，扩展不更改现有工具状态。
+
+扩展以独占创建方式在该目录写 `honcho-plugin.jsonl`（文件权限 `0600`）；已有文件或符号链接均拒绝，不覆盖、不退回共享 `/tmp`。隔离模式下既有扩展日志仅保留类别和消息 SHA-256，不写出原始消息。Honcho SDK 每个 client 将 `maxRetries` 固定为 `0`：可避免 SDK 自动重试，但网络失败更直接交由调用方处理，不代表整个应用只有一次请求，也不改变上游其他重试/回退路径。
+
+隔离 JSONL 记录扩展自有日志的哈希/类别，以及 SDK 公共 `http.request`、`stream`、`upload` 操作的开始、完成或固定错误类别、HTTP method、请求 ID 和 path 哈希；不记录 URL、请求头、凭据、正文、响应内容或 HTTP 状态。这里的 `completed` 只表示 SDK 操作 Promise 完成，不等同于 HTTP 状态成功或 Honcho 业务确认；GET/HEAD 标为 `method_read`，其他方法标为 `method_write`，这是 HTTP 方法分类而非语义副作用判断（SDK 的搜索类 POST 也会标成 `method_write`）。该日志不是每次底层 fetch/网络 attempt 的遥测：HTTP 响应状态、重试次数、原始 raw-search 直接 fetch、OMP 原生模型传输及 provider fallback 均不在此覆盖范围。故本隔离模式不得据此宣称 fail-closed transport budget 或单请求硬上限；原生 OMP/模型验收仍为 **NO_GO**，必须由单独授权的验证流程处理。
+
+隔离模式关闭时等待此扩展已跟踪的 SDK HTTP 操作、启动时后台 chat／Git 观察及其最终日志回调、session-end marker 写入，再关闭日志文件；等待期间允许这些已跟踪高层操作继续调用 SDK。stream 完成记录仅表示获得 Response，不代表流体读完。OMP shutdown handler 有宿主执行时限，因此这不构成所有后台/原生传输均已排空的证明。
+
+### 记忆候选判别（可选，默认关闭）
+
+`scripts/memory-judge.ts` 是独立评估入口，不被任何捕获或召回路径调用，也不导入 Honcho：
+
+```sh
+bun scripts/memory-judge.ts --provider off|typesafe|openai-compatible [--endpoint URL] [--model ID] --input PATH
+```
+
+- `PATH` 为恰含 `id`、`text` 两个非空白字符串字段的 JSON 对象；省略 `--provider` 等同 `off`，`off` 不发请求、不读密钥。
+- 对已通过来源准入的文本并列给出两个信号：`taskRequest`（是否主要是当前任务的请求／命令／授权／状态）与 `stableUserFact`（是否明确陈述跨任务的个人事实或长期偏好）。两者不合成作者分数，没有生产阈值，不判断真人身份，也不创建结论。
+- `typesafe`：默认 `https://api.typesafe.ai/v1/systemone`、模型 `jev-1.13.0`，密钥只取 `TYPESAFE_API_KEY`；返回模型给出的 0–1 `noul` 值，响应模型必须与请求一致。
+- `openai-compatible`：必须显式给出完整 chat/completions URL 与模型，密钥只取 `MEMORY_JUDGE_API_KEY`（本地端可省）；只接受恰含两个布尔字段的 JSON 回复，记为 `binary` 0/1，不是校准概率。这是本地 HTTP 兼容入口，不保证任意本地模型原生兼容。
+- 每次最多一次 HTTP 请求、无重试或回退、拒绝重定向，2000 ms 总时限覆盖请求与读取正文；输入超过 32 KiB UTF-8 直接报错。明文 HTTP 只允许 loopback 主机。
+- 参数或输入无效：stderr 输出 `Invalid arguments or input.`、exit 2、无网络；其余情况 stdout 输出一行结果 JSON，`ok`／`disabled` exit 0，`error`／`timeout` exit 1。
+- 接口正确不等于模型质量合格；当前判别质量未建立，不应据此启用生产路由。
 
 ## 🌱 上游归属
 

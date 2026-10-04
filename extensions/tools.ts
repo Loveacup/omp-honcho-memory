@@ -12,6 +12,31 @@ import {
 	type HonchoEnvironment,
 } from "./config.js";
 import { searchWorkspaceMessages } from "./raw-search.js";
+import { extractTextFromMessage } from "./message-utils.js";
+import { stripOmpUserText } from "../core/source.js";
+
+interface NativePromptBranchEntry {
+	type: string;
+	message?: { role: string; content?: unknown };
+}
+
+export function allowsUserConclusionFromBranch(entries: readonly NativePromptBranchEntry[]): boolean {
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const entry = entries[index];
+		const message = entry?.message;
+		if (entry?.type !== "message" || message?.role !== "user") continue;
+		return stripOmpUserText(extractTextFromMessage(message)) !== null;
+	}
+	return false;
+}
+
+function currentBranchAllowsUserConclusion(ctx: ExtensionContext): boolean {
+	try {
+		return allowsUserConclusionFromBranch(ctx.sessionManager.getBranch());
+	} catch {
+		return false;
+	}
+}
 
 export interface ToolRegistryDependencies {
 	getHandles: (ctx: ExtensionContext) => Promise<HonchoHandles | null>;
@@ -199,6 +224,9 @@ export function registerTools(pi: ExtensionAPI, deps: ToolRegistryDependencies):
 		}),
 		approval: "write",
 		async execute(_id, rawParams, _signal, _onUpdate, ctx) {
+			if (!currentBranchAllowsUserConclusion(ctx)) {
+				return { content: [{ type: "text", text: "Conclusion writes require an eligible current native user input." }], isError: true };
+			}
 			const params = rawParams as { content: string; target: "user" };
 			const handles = await deps.getHandles(ctx);
 			if (!handles) {
@@ -231,6 +259,9 @@ export function registerTools(pi: ExtensionAPI, deps: ToolRegistryDependencies):
 		}),
 		approval: "write",
 		async execute(_id, rawParams, _signal, _onUpdate, ctx) {
+			if (!currentBranchAllowsUserConclusion(ctx)) {
+				return { content: [{ type: "text", text: "Conclusion writes require an eligible current native user input." }], isError: true };
+			}
 			const params = rawParams as { content: string; target: "user" };
 			const handles = await deps.getHandles(ctx);
 			if (!handles) {
