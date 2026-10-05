@@ -1,13 +1,14 @@
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
-import { classifyEntry, stripInjectedUserText, type EntryClass, type HonchoHost } from "../core/source.js";
+import { classifyEntry, type EntryClass, type HonchoHost } from "../core/source.js";
 import { createHonchoHandles, type HonchoHandles } from "../extensions/client.js";
 import { isConfigured, resolveConfigForHost } from "../extensions/config.js";
 import { compileMemoryContext, hydrateMemoryContext } from "../extensions/memory.js";
 import { formatHonchoMemoryBlock, formatRawRecall } from "../extensions/raw-recall.js";
 import { searchWorkspaceMessages } from "../extensions/raw-search.js";
 import { sanitizeForSessionName } from "../extensions/session-key.js";
+import { hookUserText } from "./prompt-filter.js";
 
 const HOOK_TIMEOUT_MS = 7800;
 const CONTEXT_BUDGET = 6000;
@@ -95,7 +96,7 @@ async function sessionStart(host: Exclude<HonchoHost, "omp">, payload: Record<st
 async function userPrompt(host: Exclude<HonchoHost, "omp">, payload: Record<string, unknown>, entryClass: EntryClass): Promise<void> {
 	const prompt = payloadString(payload, "prompt");
 	if (!prompt) return;
-	const stripped = stripInjectedUserText(prompt);
+	const stripped = hookUserText(prompt);
 	const handles = await handlesFor(host, payload);
 	if (!handles) return;
 	const source = metadata(host, entryClass, payload);
@@ -127,7 +128,7 @@ function dryRunSummary(args: ParsedArgs, payload: Record<string, unknown>, entry
 	const config = resolveConfigForHost(args.host, cwd);
 	const configured = isConfigured(config) && sessionKey(args.host, payload) !== null;
 	const prompt = payloadString(payload, "prompt");
-	const strippedPrompt = prompt ? stripInjectedUserText(prompt) : null;
+	const strippedPrompt = prompt ? hookUserText(prompt) : null;
 	const assistant = payloadString(payload, "last_assistant_message");
 	const wouldWrite = configured && config.saveMessages !== false && entryClass === "user_interactive" && (
 		(args.event === "user-prompt" && strippedPrompt !== null) ||
